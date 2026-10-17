@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use ironrdp_core::{encode_vec, impl_as_any, Encode, WriteCursor, EncodeResult};
 use ironrdp_dvc::{DvcEncode, DvcProcessor, DvcServerProcessor};
+use ironrdp_graphics::rdp6::{BgrAChannels, BitmapStreamEncoder};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::vc::dvc::gfx::{
     Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
@@ -18,7 +19,7 @@ use ironrdp_pdu::{decode, encode_err, pdu_other_err, PduResult};
 type DvcMessage = ironrdp_dvc::DvcMessage;
 use tracing::{debug, info, warn};
 
-use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
+use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate, UncompressedRect};
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
@@ -509,9 +510,9 @@ impl GfxHandler {
         Ok(finish_zgfx(out))
     }
 
-    /// Create a ZGFX-wrapped buffer for uncompressed dirty rect updates.
-    /// Uses WireToSurface1 with Codec1Type::Uncompressed for each rect.
-    /// First call also includes surface setup PDUs.
+    /// Create a ZGFX-wrapped buffer for dirty rect updates on clients without AVC420.
+    /// Each rect goes out as WireToSurface1 with RDP6 planar (RLE) when that is smaller than the
+    /// raw BGRA, else Codec1Type::Uncompressed. First call also includes surface setup PDUs.
     pub fn create_uncompressed_pdu(state: &mut GfxState, update: &GfxUncompressedUpdate) -> Vec<u8> {
         let total_bytes: usize = update.rects.iter().map(|r| r.pixel_data.len()).sum();
         let mut out = Vec::with_capacity(ZGFX_SINGLE_HEADER + total_bytes + 64 + update.rects.len() * 32);
@@ -527,7 +528,8 @@ impl GfxHandler {
             Err(e) => log_err(e),
         }
 
-        let frame_id = state.next_frame_id();
+        // Committed by `next_frame_id()` below, once the on-wire bitmap size is known.
+        let frame_id = state.frame_id + 1;
         if let Err(e) = push_pdu(&mut out, &ServerPdu::StartFrame(StartFramePdu {
             timestamp: Timestamp { milliseconds: 0, seconds: 0, minutes: 0, hours: 0 },
             frame_id,
@@ -535,7 +537,9 @@ impl GfxHandler {
             log_err(e);
         }
 
-        // WireToSurface1 per dirty rect with Codec1Type::Uncompressed
+        // WireToSurface1 per dirty rect: RDP6 planar when RLE wins, else raw BGRA.
+        let mut planar = Vec::new();
+        let mut bitmap_bytes = 0usize;
         for rect in &update.rects {
             let dest = InclusiveRectangle {
                 left: rect.x,
@@ -543,10 +547,23 @@ impl GfxHandler {
                 right: rect.x + rect.width,
                 bottom: rect.y + rect.height,
             };
-            if let Err(e) = push_wire_to_surface1(&mut out, Codec1Type::Uncompressed, &dest, rect.pixel_data.len(), |c| {
-                c.write_slice(&rect.pixel_data);
-                Ok(())
-            }) {
+            let res = match planar_encode(rect, &mut planar) {
+                Some(n) => {
+                    bitmap_bytes += n;
+                    push_wire_to_surface1(&mut out, Codec1Type::Planar, &dest, n, |c| {
+                        c.write_slice(&planar[..n]);
+                        Ok(())
+                    })
+                }
+                None => {
+                    bitmap_bytes += rect.pixel_data.len();
+                    push_wire_to_surface1(&mut out, Codec1Type::Uncompressed, &dest, rect.pixel_data.len(), |c| {
+                        c.write_slice(&rect.pixel_data);
+                        Ok(())
+                    })
+                }
+            };
+            if let Err(e) = res {
                 log_err(e);
             }
         }
@@ -555,10 +572,14 @@ impl GfxHandler {
             log_err(e);
         }
 
+        state.last_frame_bytes = bitmap_bytes as u32;
+        let committed = state.next_frame_id();
+        debug_assert_eq!(committed, frame_id);
+
         debug!(
             frame_id,
             rects = update.rects.len(),
-            raw_bytes = total_bytes,
+            bitmap_bytes,
             "GFX uncompressed frame PDU created",
         );
 
@@ -720,6 +741,17 @@ fn push_pdu(out: &mut Vec<u8>, pdu: &ServerPdu) -> PduResult<()> {
     pdu.encode(&mut cur).map_err(|e| encode_err!(e))
 }
 
+/// RDP6 planar (RLE, no alpha) encode of a tightly packed BGRA rect into `buf`. Every GFX client
+/// must support Codec1Type::Planar (MS-RDPEGFX 2.2.4.4), so no capability check is needed.
+/// `buf` is capped one byte below the raw size so the encoder errors out instead of producing a
+/// stream that is not strictly smaller; `None` means "send it uncompressed".
+fn planar_encode(rect: &UncompressedRect, buf: &mut Vec<u8>) -> Option<usize> {
+    buf.resize(rect.pixel_data.len().saturating_sub(1), 0);
+    BitmapStreamEncoder::new(usize::from(rect.width), usize::from(rect.height))
+        .encode_bitmap::<BgrAChannels>(&rect.pixel_data, buf, true)
+        .ok()
+}
+
 /// Encode RDPGFX_WIRE_TO_SURFACE_PDU_1 straight into `out`, letting `write_bitmap` stream the
 /// codec payload into place. Avoids the `bitmap_data: Vec<u8>` copy that `WireToSurface1Pdu` requires.
 fn push_wire_to_surface1(
@@ -863,7 +895,6 @@ mod tests {
     use ironrdp_pdu::rdp::vc::dvc::gfx::{CapabilitiesV8Flags, CapabilitiesV107Flags};
 
     use super::*;
-    use crate::display::UncompressedRect;
 
     /// Build a raw RDPGFX_CAPS_ADVERTISE (cmdId 0x12) from `(version, flags)` pairs.
     fn caps_advertise(sets: &[(u32, u32)]) -> Vec<u8> {
@@ -984,6 +1015,78 @@ mod tests {
             other => panic!("expected WireToSurface1, got {other:?}"),
         }
         assert!(matches!(pdus[5], ServerPdu::EndFrame(_)));
+    }
+
+    /// Deterministic pseudo-random BGRA (xorshift32) so the planar tests need no rand dep.
+    fn noise_bgra(pixels: usize, mut seed: u32) -> Vec<u8> {
+        (0..pixels * 4)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect()
+    }
+
+    fn rect_64x48(pixel_data: Vec<u8>) -> UncompressedRect {
+        UncompressedRect { x: 3, y: 5, width: 64, height: 48, pixel_data: Bytes::from(pixel_data) }
+    }
+
+    /// Decode a planar stream and compare RGB against the BGRA source (alpha ignored).
+    fn assert_planar_matches(planar: &[u8], bgra: &[u8], width: usize, height: usize) {
+        let mut rgb = Vec::new();
+        ironrdp_graphics::rdp6::BitmapStreamDecoder::default()
+            .decode_bitmap_stream_to_rgb24(planar, &mut rgb, width, height)
+            .unwrap();
+        assert_eq!(rgb.len(), width * height * 3);
+        for (i, px) in bgra.chunks_exact(4).enumerate() {
+            assert_eq!(&rgb[i * 3..i * 3 + 3], &[px[2], px[1], px[0]], "pixel {i}");
+        }
+    }
+
+    #[test]
+    fn planar_rect_round_trips_through_ironrdp_decoder() {
+        let bgra = noise_bgra(64 * 48, 0x9E37_79B9);
+        let rect = rect_64x48(bgra.clone());
+        let mut buf = Vec::new();
+        let n = planar_encode(&rect, &mut buf).expect("planar must beat raw BGRA (drops alpha)");
+        assert!(n < bgra.len());
+        assert_planar_matches(&buf[..n], &bgra, 64, 48);
+    }
+
+    #[test]
+    fn uncompressed_pdu_uses_planar_when_smaller() {
+        let pdu = caps_advertise(&[(0xA_0701, CapabilitiesV107Flags::AVC_DISABLED.bits())]);
+        let (mut h, state) = handler();
+        h.process(7, &wrap_zgfx(&pdu)).unwrap();
+        let mut s = state.lock().unwrap();
+
+        let bgra = noise_bgra(64 * 48, 0x1234_5678);
+        let update = GfxUncompressedUpdate { rects: vec![rect_64x48(bgra.clone())], width: 1920, height: 1080 };
+        let data = GfxHandler::create_uncompressed_pdu(&mut s, &update);
+        let pdus = decode_all(&unwrap_zgfx(&data).unwrap());
+        match &pdus[4] {
+            ServerPdu::WireToSurface1(w) => {
+                assert_eq!(w.codec_id, Codec1Type::Planar);
+                assert_eq!(w.destination_rectangle, InclusiveRectangle { left: 3, top: 5, right: 67, bottom: 53 });
+                assert!(w.bitmap_data.len() < bgra.len());
+                assert_eq!(s.last_frame_bytes as usize, w.bitmap_data.len(), "stats must see on-wire bytes");
+                assert_planar_matches(&w.bitmap_data, &bgra, 64, 48);
+            }
+            other => panic!("expected WireToSurface1, got {other:?}"),
+        }
+        assert_eq!(s.frame_id, 1);
+    }
+
+    #[test]
+    fn planar_solid_rect_is_much_smaller_than_raw() {
+        let bgra: Vec<u8> = [0x10, 0x80, 0xF0, 0xFF].repeat(64 * 48);
+        let rect = rect_64x48(bgra.clone());
+        let mut buf = Vec::new();
+        let n = planar_encode(&rect, &mut buf).unwrap();
+        assert!(n * 8 < bgra.len(), "planar {n} B vs raw {} B", bgra.len());
+        assert_planar_matches(&buf[..n], &bgra, 64, 48);
     }
 
     #[test]
