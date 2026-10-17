@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::color_convert::VImageConverter;
-use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder, LIMITED_RANGE};
+use crate::{warn_limited, Avc444EncodedFrame, EncodedFrame, VideoEncoder, LIMITED_RANGE};
 
 // --- FFI declarations ---
 
@@ -182,6 +182,8 @@ const K_CF_NUMBER_FLOAT64_TYPE: i64 = 13;
 
 // Pixel format: NV12 biplanar, tagged to match the crate-wide range (see `LIMITED_RANGE`):
 // '420v' (video range, Y 16-235) or '420f' (full range, Y 0-255).
+// The zero-copy capture path must deliver the same tag: pick
+// `macrdp_capture::CapturePixelFormat::nv12(LIMITED_RANGE)` (Nv12Video / Nv12Full).
 const K_CV_PIXEL_FORMAT_NV12: u32 = if LIMITED_RANGE { 0x34323076 } else { 0x34323066 };
 
 // H.264 codec type
@@ -210,7 +212,7 @@ extern "C" fn encode_callback(
 
     if status != 0 || sample_buffer.is_null() {
         // Signal has_data so encoder doesn't timeout waiting — it will get empty data
-        tracing::warn!(status, null_buf = sample_buffer.is_null(), "VT encode callback error");
+        warn_limited!(status, null_buf = sample_buffer.is_null(), "VT encode callback error");
         ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
         ctx.ready.notify_one();
         return;
@@ -662,6 +664,33 @@ impl VtEncoder {
         }
     }
 
+    /// Black out the NV12 region outside `sw`×`sh` up to `enc_w`×`enc_h` (Y=0, UV=128).
+    /// Real content rows/cols are untouched; the caller writes them afterwards.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fill_nv12_padding(
+        y_base: *mut u8, y_bpr: usize, uv_base: *mut u8, uv_bpr: usize,
+        enc_w: usize, enc_h: usize, sw: usize, sh: usize,
+    ) {
+        if sw >= enc_w && sh >= enc_h { return; }
+        // Y plane
+        for row in 0..sh {
+            if sw < enc_w { std::ptr::write_bytes(y_base.add(row * y_bpr + sw), 0, enc_w - sw); }
+        }
+        for row in sh..enc_h {
+            std::ptr::write_bytes(y_base.add(row * y_bpr), 0, enc_w);
+        }
+        // UV plane: interleaved, `enc_w` bytes per row; real content covers ceil(sw/2) cells
+        // and ceil(sh/2) rows (odd edges are written by `fill_odd_edges`).
+        let uv_w_real = sw.div_ceil(2) * 2;
+        let uv_h_real = sh.div_ceil(2);
+        for row in 0..uv_h_real {
+            if uv_w_real < enc_w { std::ptr::write_bytes(uv_base.add(row * uv_bpr + uv_w_real), 128, enc_w - uv_w_real); }
+        }
+        for row in uv_h_real..enc_h / 2 {
+            std::ptr::write_bytes(uv_base.add(row * uv_bpr), 128, enc_w);
+        }
+    }
+
     /// BGRA → NV12 pool buffer. vImage SIMD for the even interior when available (scalar
     /// otherwise), then odd edge column/row via scalar so any frame size encodes.
     #[allow(clippy::too_many_arguments)]
@@ -685,12 +714,16 @@ impl VtEncoder {
             match vimage.bgra_to_nv12(data, w as u32, h as u32, stride,
                                       &mut self.nv12_y_buf[..y_size], &mut self.nv12_uv_buf[..uv_size]) {
                 Ok(()) => use_vimage = true,
-                Err(e) => tracing::warn!("vImage bgra_to_nv12 failed ({e}), using scalar path"),
+                Err(e) => warn_limited!("vImage bgra_to_nv12 failed ({e}), using scalar path"),
             }
         }
 
         unsafe {
             let (pb, y_base, y_bpr, uv_base, uv_bpr) = Self::lock_pool_nv12(session)?;
+            // Pool buffers rotate and are recycled, so the align16 padding holds whatever the
+            // previous user left there. Neutralise it (Y=0, UV=128) whenever the source is
+            // smaller than the session; the area is at most 15 rows + 15 columns.
+            Self::fill_nv12_padding(y_base, y_bpr, uv_base, uv_bpr, enc_w as usize, enc_h as usize, sw, sh);
             if use_vimage {
                 for row in 0..h {
                     std::ptr::copy_nonoverlapping(self.nv12_y_buf[row * w..].as_ptr(), y_base.add(row * y_bpr), w);
@@ -820,7 +853,7 @@ impl VtEncoder {
         }
 
         if timed_out {
-            tracing::warn!(frame = frame_count, "VT callback timeout — forcing CompleteFrames");
+            warn_limited!(frame = frame_count, "VT callback timeout — forcing CompleteFrames");
             unsafe {
                 VTCompressionSessionCompleteFrames(session, pts);
             }
@@ -888,7 +921,7 @@ impl VtEncoder {
         }
 
         if timed_out {
-            tracing::warn!("VT collect timeout — forcing CompleteFrames");
+            warn_limited!("VT collect timeout — forcing CompleteFrames");
             unsafe {
                 let pts = CMTime { value: 0, timescale: 1, flags: 0, epoch: 0 };
                 VTCompressionSessionCompleteFrames(session, pts);
@@ -908,7 +941,7 @@ impl VtEncoder {
         if ctx.has_data.load(std::sync::atomic::Ordering::Acquire) {
             Ok(guard.take())
         } else {
-            tracing::warn!("VT collect: no data after timeout + CompleteFrames");
+            warn_limited!("VT collect: no data after timeout + CompleteFrames");
             Ok(None)
         }
     }
@@ -1196,6 +1229,8 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn supports_pipelining(&self) -> bool { true }
+
+    fn supports_pixel_buffer(&self) -> bool { true }
 
     fn submit_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<()> {
         let pixel_buffer = self.create_nv12_vimage(

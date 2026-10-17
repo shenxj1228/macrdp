@@ -64,6 +64,11 @@ pub trait VideoEncoder: Send {
     /// Whether this encoder supports async submit/collect pipelining.
     fn supports_pipelining(&self) -> bool { false }
 
+    /// Whether `encode_pixel_buffer` / `submit_pixel_buffer` (zero-copy NV12 CVPixelBuffer input)
+    /// are implemented. Callers use this to pick the capture pixel format *after* the encoder
+    /// was actually created, so a VT→OpenH264 fallback never ends up fed NV12 frames.
+    fn supports_pixel_buffer(&self) -> bool { false }
+
     /// Submit a BGRA frame for async encoding. Returns immediately.
     fn submit_bgra(&mut self, _data: &[u8], _width: u32, _height: u32, _stride: usize) -> Result<()> {
         anyhow::bail!("submit_bgra not supported by this encoder")
@@ -78,6 +83,42 @@ pub trait VideoEncoder: Send {
     fn collect_encoded(&mut self, _timeout: std::time::Duration) -> Result<Option<EncodedFrame>> {
         Ok(None)
     }
+}
+
+/// Per-call-site 5-second rate limiter for `warn!` on per-frame failure paths.
+pub struct LogLimiter(std::sync::Mutex<Option<std::time::Instant>>);
+
+impl LogLimiter {
+    pub const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// True at most once per 5 seconds.
+    pub fn allow(&self) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(t) if t.elapsed() < std::time::Duration::from_secs(5) => false,
+            _ => {
+                *last = Some(std::time::Instant::now());
+                true
+            }
+        }
+    }
+}
+
+impl Default for LogLimiter {
+    fn default() -> Self { Self::new() }
+}
+
+/// `tracing::warn!` that fires at most once per 5 s per call site.
+#[macro_export]
+macro_rules! warn_limited {
+    ($($arg:tt)*) => {{
+        static LIMITER: $crate::LogLimiter = $crate::LogLimiter::new();
+        if LIMITER.allow() {
+            tracing::warn!($($arg)*);
+        }
+    }};
 }
 
 /// Align a dimension up to the nearest multiple of 16 (H.264 macroblock size)
