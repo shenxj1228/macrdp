@@ -111,7 +111,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        let Some(m) = &self.mouse else { return };
+        let Some(m) = &mut self.mouse else { return };
 
         let result = match event {
             MouseEvent::Move { x, y } => {
@@ -138,7 +138,11 @@ impl RdpServerInputHandler for MacInputHandler {
             MouseEvent::MiddleReleased => {
                 m.button_event(MouseButton::Middle, false, self.last_mouse_x, self.last_mouse_y)
             }
-            MouseEvent::VerticalScroll { value } => m.scroll(value),
+            MouseEvent::VerticalScroll { value } => m.scroll(value, 0),
+            MouseEvent::Scroll { x, y } => m.scroll(
+                y.clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+                x.clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+            ),
             _ => {
                 tracing::trace!(?event, "Unhandled mouse event");
                 Ok(())

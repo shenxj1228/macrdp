@@ -146,9 +146,32 @@ impl From<SyncToggleFlags> for KeyboardEvent {
     }
 }
 
+/// Recover the 9-bit two's-complement wheel delta (MS-RDPBCGR 2.2.8.1.1.3.1.1.3).
+///
+/// `ironrdp-pdu` decodes the low 8 bits as magnitude and negates it when
+/// `WHEEL_NEGATIVE` is set, so -120 (wire 0x188) arrives as -136. Sign-extend
+/// the 9-bit field instead.
+fn wheel_units(value: &MousePdu) -> i16 {
+    let low8 = i16::from(value.number_of_wheel_rotation_units.unsigned_abs().to_le_bytes()[0]);
+    if value.flags.contains(PointerFlags::WHEEL_NEGATIVE) {
+        low8 - 256
+    } else {
+        low8
+    }
+}
+
 impl From<MousePdu> for MouseEvent {
     fn from(value: MousePdu) -> Self {
-        if value.flags.contains(PointerFlags::LEFT_BUTTON) {
+        if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
+            MouseEvent::VerticalScroll {
+                value: wheel_units(&value),
+            }
+        } else if value.flags.contains(PointerFlags::HORIZONTAL_WHEEL) {
+            MouseEvent::Scroll {
+                x: i32::from(wheel_units(&value)),
+                y: 0,
+            }
+        } else if value.flags.contains(PointerFlags::LEFT_BUTTON) {
             if value.flags.contains(PointerFlags::DOWN) {
                 MouseEvent::LeftPressed
             } else {
@@ -160,9 +183,11 @@ impl From<MousePdu> for MouseEvent {
             } else {
                 MouseEvent::RightReleased
             }
-        } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
-            MouseEvent::VerticalScroll {
-                value: value.number_of_wheel_rotation_units,
+        } else if value.flags.contains(PointerFlags::MIDDLE_BUTTON_OR_WHEEL) {
+            if value.flags.contains(PointerFlags::DOWN) {
+                MouseEvent::MiddlePressed
+            } else {
+                MouseEvent::MiddleReleased
             }
         } else {
             MouseEvent::Move {
