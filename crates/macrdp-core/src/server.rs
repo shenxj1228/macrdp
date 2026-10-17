@@ -38,7 +38,7 @@ pub fn resolve_resolution(
 
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
 use std::time::Instant;
@@ -50,6 +50,7 @@ use tokio::task::JoinHandle;
 
 use crate::callbacks::*;
 use crate::config::ServerConfig;
+use crate::perf_stats::SharedPerfStats;
 use crate::permissions;
 use crate::tls;
 
@@ -59,7 +60,8 @@ pub struct ServerHandle {
     started_at: Instant,
     gfx_state: Arc<Mutex<GfxState>>,
     shutdown_notify: Arc<Notify>,
-    stopped: AtomicBool,
+    /// Shared with the server thread, which sets it when it exits for any reason.
+    stopped: Arc<AtomicBool>,
     /// The OS thread running the RDP server (RdpServer is !Send, needs dedicated thread)
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
@@ -120,7 +122,9 @@ impl ServerHandle {
         if self.stopped.swap(true, Ordering::Relaxed) {
             return Ok(()); // Already stopped
         }
-        self.shutdown_notify.notify_waiters();
+        // notify_one stores a permit, so the signal is not lost if the server
+        // thread has not reached `notified().await` yet.
+        self.shutdown_notify.notify_one();
 
         // Extract thread handle from mutex *before* the await point so that
         // the MutexGuard is dropped and the future remains Send.
@@ -143,7 +147,7 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         if !self.stopped.load(Ordering::Relaxed) {
-            self.shutdown_notify.notify_waiters();
+            self.shutdown_notify.notify_one();
         }
     }
 }
@@ -165,6 +169,9 @@ struct ServerThreadArgs {
     shutdown_notify: Arc<Notify>,
     handler: Arc<dyn ServerEventHandler>,
     config_rx: tokio::sync::mpsc::UnboundedReceiver<ConfigUpdate>,
+    perf_stats: Option<SharedPerfStats>,
+    /// Hot-updatable capture frame rate (read by MacDisplay on each new connection).
+    hot_fps: Arc<AtomicU32>,
 }
 
 /// Try to bind to the given address. If the port is in use, try the next 99 ports.
@@ -206,6 +213,16 @@ fn find_available_port(addr: &str, preferred_port: u16) -> Result<(TcpListener, 
 pub async fn start_server(
     config: ServerConfig,
     handler: impl ServerEventHandler,
+) -> Result<Arc<ServerHandle>> {
+    start_server_with_perf(config, handler, None).await
+}
+
+/// Like [`start_server`], but with an optional frame-level performance statistics
+/// collector (CLI `--perf`). The caller keeps the `Arc` and prints the summary on exit.
+pub async fn start_server_with_perf(
+    config: ServerConfig,
+    handler: impl ServerEventHandler,
+    perf_stats: Option<SharedPerfStats>,
 ) -> Result<Arc<ServerHandle>> {
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
 
@@ -267,7 +284,6 @@ pub async fn start_server(
 
     // Resolution
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
-    let res_auto = res_mode == "auto";
     let (width, height) = resolve_resolution(res_mode, width, height);
 
     // Mouse coordinate mapping: mac = rdp × cg_logical ÷ rdp_desktop
@@ -284,6 +300,8 @@ pub async fn start_server(
     drop(listener);
     let shutdown_notify = Arc::new(Notify::new());
     let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel::<ConfigUpdate>();
+    let hot_fps = Arc::new(AtomicU32::new(config.frame_rate));
+    let stopped = Arc::new(AtomicBool::new(false));
 
     // Pack everything the server thread needs
     let args = ServerThreadArgs {
@@ -301,22 +319,27 @@ pub async fn start_server(
         shutdown_notify: Arc::clone(&shutdown_notify),
         handler: Arc::clone(&handler),
         config_rx,
+        perf_stats,
+        hot_fps: Arc::clone(&hot_fps),
     };
 
     // Spawn RDP server on a dedicated OS thread.
     // RdpServer is !Send (contains dyn SoundServerFactory, dyn CliprdrServerFactory),
     // so we construct and run it entirely within this thread.
+    let thread_stopped = Arc::clone(&stopped);
     let server_thread = std::thread::Builder::new()
         .name("rdp-server".into())
         .spawn(move || {
             run_server_thread(args);
+            // Any exit (TLS error, server.run() error, shutdown) means we are no longer running.
+            thread_stopped.store(true, Ordering::Relaxed);
         })
         .context("Failed to spawn RDP server thread")?;
 
     // Spawn metrics ticker (1 second interval) — all types here are Send
     let metrics_gfx = Arc::clone(&gfx_state);
     let handler_for_metrics = Arc::clone(&handler);
-    let fps = config.frame_rate;
+    let metrics_fps = Arc::clone(&hot_fps);
     let metrics_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut prev_bytes_sent: u64 = 0;
@@ -342,7 +365,7 @@ pub async fn start_server(
                 .unwrap_or_default()
                 .as_secs();
             handler_for_metrics.on_metrics(Metrics {
-                fps,
+                fps: metrics_fps.load(Ordering::Relaxed),
                 bitrate_kbps,
                 rtt_ms,
                 bytes_sent,
@@ -361,7 +384,7 @@ pub async fn start_server(
         started_at: Instant::now(),
         gfx_state,
         shutdown_notify,
-        stopped: AtomicBool::new(false),
+        stopped,
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(Some(metrics_task)),
         config_tx,
@@ -472,7 +495,8 @@ fn run_server_thread(args: ServerThreadArgs) {
             Arc::clone(&args.gfx_state),
             args.coord_mapper,
             shared_audio_tx,
-            None, // perf_stats: not exposed via macrdp-core API yet
+            args.perf_stats,
+            Arc::clone(&args.hot_fps),
         );
 
         // Build RDP server (this is the !Send type)
@@ -516,6 +540,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                 println!("  │  Username: {:<22}│", &user);
                 println!("  │  Password: {:<22}│", &random_pass);
                 println!("  └──────────────────────────────────┘\n");
+                tracing::info!("Set [username] and [password] in ~/.config/macrdp/config.toml to use fixed credentials");
                 (user, random_pass)
             }
         };
@@ -530,12 +555,14 @@ fn run_server_thread(args: ServerThreadArgs) {
 
         // Spawn config hot-update listener
         let gfx_for_config = Arc::clone(&args.gfx_state);
+        let fps_for_config = Arc::clone(&args.hot_fps);
         let ev_sender = server.event_sender().clone();
         tokio::task::spawn_local(async move {
             while let Some(update) = config_rx.recv().await {
                 match update {
                     ConfigUpdate::FrameRate(fps) => {
                         tracing::info!(fps, "Hot-update: frame_rate (next connection)");
+                        fps_for_config.store(fps, Ordering::Relaxed);
                     }
                     ConfigUpdate::BitrateKbps(kbps) => {
                         let bps = kbps * 1000;

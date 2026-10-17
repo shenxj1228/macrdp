@@ -43,10 +43,13 @@ impl MouseCoordMapper {
 
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
         let mut s = self.0.lock().unwrap();
+        let old_w = s.rdp_w;
+        let old_h = s.rdp_h;
         s.rdp_w = rdp_w.max(1) as f64;
         s.rdp_h = rdp_h.max(1) as f64;
         tracing::info!(
             new_rdp_w = rdp_w, new_rdp_h = rdp_h,
+            old_rdp_w = old_w, old_rdp_h = old_h,
             logical_w = s.logical_w, logical_h = s.logical_h,
             "MouseCoordMapper: RDP desktop size updated"
         );

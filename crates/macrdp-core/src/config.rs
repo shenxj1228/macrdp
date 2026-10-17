@@ -108,14 +108,20 @@ impl ServerConfig {
     /// Load config from a TOML file path, or use defaults if None.
     pub fn load_from_file(path: Option<&std::path::Path>) -> anyhow::Result<Self> {
         if let Some(path) = path {
+            tracing::info!(?path, "Loading config from CLI-specified path");
             let content = std::fs::read_to_string(path)?;
             Ok(toml::from_str(&content)?)
         } else {
             let default_path = config_dir().join("config.toml");
             if default_path.exists() {
+                tracing::info!(path = %default_path.display(), "Loading config");
                 let content = std::fs::read_to_string(&default_path)?;
                 Ok(toml::from_str(&content)?)
             } else {
+                tracing::info!(
+                    search_paths = ?config_dir_candidates().iter().map(|p| p.join("config.toml")).collect::<Vec<_>>(),
+                    "No config.toml found, using defaults"
+                );
                 Ok(ServerConfig::default())
             }
         }
@@ -177,5 +183,6 @@ mod tests {
         assert_eq!(config.port, 13389);
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
+        assert_eq!(config.password.as_deref(), Some("secret"));
     }
 }
