@@ -349,18 +349,19 @@ impl RdpServer {
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
+        // SVC chunks are only 1600 bytes; Nagle would batch them and add latency to every frame.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY: {e}");
+        }
         let framed = TokioFramed::new(stream);
 
-        // Reset GFX state for new connection, preserving peer IP and hot-updated resolution
+        // Reset per-session GFX state for the new connection; size, avc444_enabled and all
+        // hot-updated fields (bitrate/cursor/encoder/chroma/resolution) survive the reset.
         let pending_resolution = {
             let mut gs = self.gfx_state.lock().unwrap();
-            let w = gs.width;
-            let h = gs.height;
-            let avc444_enabled = gs.avc444_enabled;
-            let res = gs.resolution.take();
-            *gs = GfxState::new(w, h, avc444_enabled);
+            gs.reset_session();
             gs.peer_addr = peer_ip;
-            res
+            gs.resolution.take()
         };
 
         // Apply hot-updated resolution for this new connection
@@ -549,7 +550,21 @@ impl RdpServer {
                 if let Some(drdynvc_id) = drdynvc_channel_id {
                     let channel_id = state.channel_id.unwrap();
                     // All frame PDUs combined into a single ZGFX-wrapped buffer
-                    let pdu_data = GfxHandler::create_frame_pdu(&mut state, gfx_frame);
+                    let pdu_data = match GfxHandler::create_frame_pdu(&mut state, gfx_frame) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            drop(state);
+                            // Client negotiated GFX without AVC420: the display layer should be
+                            // sending GfxUncompressed instead. Warn once per ~5 s, drop the frame.
+                            static LAST_WARN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                            let mut last = LAST_WARN.lock().unwrap();
+                            if last.is_none_or(|t| t.elapsed() >= core::time::Duration::from_secs(5)) {
+                                warn!("Dropping GfxFrame: {e}");
+                                *last = Some(std::time::Instant::now());
+                            }
+                            return Ok((RunState::Continue, encoder));
+                        }
+                    };
                     drop(state); // release lock before async
 
                     // Send as a single DVC message (auto-fragmented by encode_dvc_messages)
