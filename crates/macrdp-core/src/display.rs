@@ -37,6 +37,8 @@ pub struct MacDisplay {
     /// Whether AVC444 mode is requested by config
     mode_444: bool,
     show_cursor: bool,
+    /// Explicit bitrate (config or hot-update). When set it wins over the fps/size-derived value.
+    bitrate_override: Option<u32>,
     base_bitrate: u32,
     gfx_state: Arc<Mutex<GfxState>>,
     coord_mapper: MouseCoordMapper,
@@ -76,7 +78,7 @@ impl MacDisplay {
             width, height,
             max_width: max_w, max_height: max_h,
             fixed_resolution,
-            frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, gfx_state,
+            frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, base_bitrate, gfx_state,
             coord_mapper,
             shared_audio_tx,
             perf_stats,
@@ -86,6 +88,13 @@ impl MacDisplay {
 }
 
 impl MacDisplay {
+    /// `bitrate_override` wins; otherwise derive from current size / fps / quality.
+    fn recompute_bitrate(&mut self) {
+        self.base_bitrate = self.bitrate_override.unwrap_or_else(|| macrdp_encode::screen_bitrate(
+            self.width as u32, self.height as u32, self.frame_rate as f32, self.quality,
+        ));
+    }
+
     fn apply_resize(&mut self, width: u16, height: u16, source: &str) {
         let w = width.min(self.max_width);
         let h = height.min(self.max_height);
@@ -98,9 +107,7 @@ impl MacDisplay {
             );
             self.width = w;
             self.height = h;
-            self.base_bitrate = macrdp_encode::screen_bitrate(
-                w as u32, h as u32, self.frame_rate as f32, self.quality,
-            );
+            self.recompute_bitrate();
             self.coord_mapper.update_rdp_size(w, h);
         }
     }
@@ -127,10 +134,15 @@ impl RdpServerDisplay for MacDisplay {
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         // Apply hot-updated settings (written by the config task into GfxState / hot_fps).
+        // fps first: an explicit target_bitrate must win over the fps-derived default.
+        let hot_fps = self.hot_fps.load(Ordering::Relaxed);
+        if hot_fps > 0 && hot_fps != self.frame_rate {
+            self.frame_rate = hot_fps;
+        }
         {
             let mut gs = self.gfx_state.lock().unwrap();
             if let Some(bps) = gs.target_bitrate {
-                self.base_bitrate = bps;
+                self.bitrate_override = Some(bps);
             }
             if let Some(show) = gs.show_cursor {
                 self.show_cursor = show;
@@ -143,20 +155,31 @@ impl RdpServerDisplay for MacDisplay {
                 gs.avc444_enabled = self.mode_444;
             }
         }
-        let hot_fps = self.hot_fps.load(Ordering::Relaxed);
-        if hot_fps > 0 && hot_fps != self.frame_rate {
-            self.frame_rate = hot_fps;
-            self.base_bitrate = macrdp_encode::screen_bitrate(
-                self.width as u32, self.height as u32, hot_fps as f32, self.quality,
-            );
+        self.recompute_bitrate();
+
+        // Create the H.264 encoder first: the capture pixel format depends on what the encoder
+        // that was *actually* built accepts (VT→OpenH264 fallback must never be fed NV12).
+        let enc_params = EncoderParams {
+            width: self.width as u32,
+            height: self.height as u32,
+            fps: self.frame_rate as f32,
+            quality: self.quality,
+            pref: self.encoder_pref,
+            mode_444: self.mode_444,
+            bitrate: self.base_bitrate,
+        };
+        let encoder = enc_params.create();
+        if encoder.is_some() {
+            tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
+        let zero_copy = encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444;
 
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
             frame_rate: self.frame_rate,
-            pixel_format: if self.encoder_pref == macrdp_encode::EncoderPreference::Hardware && !self.mode_444 {
-                CapturePixelFormat::Nv12
+            pixel_format: if zero_copy {
+                CapturePixelFormat::nv12(macrdp_encode::LIMITED_RANGE)
             } else {
                 CapturePixelFormat::Bgra
             },
@@ -166,21 +189,6 @@ impl RdpServerDisplay for MacDisplay {
         let audio_tx = self.shared_audio_tx.as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
         let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
-
-        // Create H.264 encoder with configured quality and encoder preference
-        let encoder = macrdp_encode::create_encoder(
-            self.width as u32,
-            self.height as u32,
-            self.frame_rate as f32,
-            self.quality,
-            self.encoder_pref,
-            self.mode_444,
-            self.base_bitrate,
-        ).ok();
-
-        if encoder.is_some() {
-            tracing::info!("H.264 encoder available — will use GFX path when client supports it");
-        }
 
         let peer_addr = {
             let gfx = self.gfx_state.lock().unwrap();
@@ -196,6 +204,7 @@ impl RdpServerDisplay for MacDisplay {
             capturer,
             capture_config,
             encoder,
+            enc_params,
             gfx_state: Arc::clone(&self.gfx_state),
             mode_444: self.mode_444,
             display_frame_count: 0,
@@ -213,7 +222,28 @@ impl RdpServerDisplay for MacDisplay {
             bitmap_fallback: false,
             keyframe_requested: true,
             ack_skip_streak: 0,
+            last_full_uncompressed: None,
         }))
+    }
+}
+
+/// Everything needed to (re)build the H.264 encoder for this stream.
+#[derive(Clone, Copy)]
+struct EncoderParams {
+    width: u32,
+    height: u32,
+    fps: f32,
+    quality: Quality,
+    pref: macrdp_encode::EncoderPreference,
+    mode_444: bool,
+    bitrate: u32,
+}
+
+impl EncoderParams {
+    fn create(&self) -> Option<Box<dyn VideoEncoder>> {
+        macrdp_encode::create_encoder(self.width, self.height, self.fps, self.quality, self.pref, self.mode_444, self.bitrate)
+            .map_err(|e| tracing::error!("H.264 encoder creation failed: {e}"))
+            .ok()
     }
 }
 
@@ -230,6 +260,8 @@ struct MacDisplayUpdates {
     capturer: ScreenCapturer,
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
+    /// Parameters the encoder was built with — used to rebuild it after a panic/cancel.
+    enc_params: EncoderParams,
     gfx_state: Arc<Mutex<GfxState>>,
     mode_444: bool,
     display_frame_count: u64,
@@ -261,6 +293,8 @@ struct MacDisplayUpdates {
     keyframe_requested: bool,
     /// Consecutive frames skipped because of ACK backlog.
     ack_skip_streak: u32,
+    /// When the last whole-frame uncompressed update was sent (no-AVC420 client throttle).
+    last_full_uncompressed: Option<Instant>,
 }
 
 /// How long to wait for the client to open and negotiate the GFX channel before falling
@@ -271,6 +305,10 @@ const MAX_PENDING_ACKS: u32 = 3;
 /// Upper bound on consecutive ACK-backlog skips, so a client that suspends frame
 /// acknowledgements (SUSPEND_FRAME_ACKNOWLEDGEMENT) cannot stall the stream.
 const MAX_ACK_SKIP_STREAK: u32 = 10;
+/// Minimum interval between whole-frame uncompressed updates (clients without AVC420).
+/// ponytail: hard 10 fps cap — a 1080p raw frame is ~8 MB, so this bounds the no-AVC path at
+/// ~80 MB/s. Upgrade path: RemoteFX / Planar codec instead of raw BGRA.
+const FULL_UNCOMPRESSED_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
@@ -421,6 +459,36 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Run a blocking encoder call on the blocking pool so the single-threaded server
+    /// runtime keeps handling input/ACKs. The encoder is *always* restored afterwards: on a
+    /// panic inside `f` or a cancelled task it is rebuilt from `enc_params` (and the next
+    /// frame is forced to a keyframe) instead of being lost for the rest of the session.
+    async fn with_encoder_blocking<T: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut dyn VideoEncoder) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let Some(mut enc) = self.encoder.take() else { anyhow::bail!("no encoder") };
+        let joined = tokio::task::spawn_blocking(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(enc.as_mut())));
+            (enc, r)
+        })
+        .await;
+        let err = match joined {
+            Ok((enc, Ok(r))) => {
+                self.encoder = Some(enc);
+                return r;
+            }
+            Ok((_, Err(_))) => anyhow::anyhow!("encoder panicked"),
+            Err(join) => anyhow::anyhow!("encoder task cancelled: {join}"),
+        };
+        tracing::error!("{err} — rebuilding H.264 encoder");
+        self.encoder = self.enc_params.create();
+        self.keyframe_requested = true;
+        self.has_pending_submit = false;
+        self.pending_frame_time = None;
+        Err(err)
+    }
+
     /// Size of the cached last frame (also the size of any pending pipelined submit).
     fn cached_frame_size(&self) -> (u16, u16) {
         match &self.last_frame_cache {
@@ -482,11 +550,11 @@ impl MacDisplayUpdates {
                 })))
             }
             Ok(_) => {
-                tracing::warn!("Idle IDR encode returned empty data");
+                macrdp_encode::warn_limited!("Idle IDR encode returned empty data");
                 Ok(None)
             }
             Err(e) => {
-                tracing::warn!("Idle IDR encode failed: {e}");
+                macrdp_encode::warn_limited!("Idle IDR encode failed: {e}");
                 Ok(None)
             }
         }
@@ -531,13 +599,23 @@ impl MacDisplayUpdates {
 
     /// Collect a previously submitted async (pipelined) encode result and build a GFX DisplayUpdate.
     async fn collect_and_send_pending(&mut self, frame_width: u16, frame_height: u16) -> Result<Option<DisplayUpdate>> {
-        let encoder = match &mut self.encoder {
-            Some(e) if e.supports_pipelining() => e,
-            _ => return Ok(None),
-        };
+        if !self.encoder.as_ref().is_some_and(|e| e.supports_pipelining()) {
+            return Ok(None);
+        }
 
-        let timeout = std::time::Duration::from_millis(32);
-        match encoder.collect_encoded(timeout)? {
+        let collected = match self
+            .with_encoder_blocking(|enc| enc.collect_encoded(Duration::from_millis(32)))
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                macrdp_encode::warn_limited!("Pipelined collect failed: {e} — frame lost");
+                self.has_pending_submit = false;
+                self.pending_frame_time = None;
+                return Ok(Some(DisplayUpdate::DefaultPointer));
+            }
+        };
+        match collected {
             Some(encoded) if !encoded.data.is_empty() => {
                 let encode_ms = self.pending_frame_time
                     .map(|t| t.elapsed().as_secs_f64() * 1000.0)
@@ -588,7 +666,7 @@ impl MacDisplayUpdates {
                 Ok(Some(DisplayUpdate::DefaultPointer))
             }
             None => {
-                tracing::warn!("Pipelined collect timed out — frame lost");
+                macrdp_encode::warn_limited!("Pipelined collect timed out — frame lost");
                 self.has_pending_submit = false;
                 self.pending_frame_time = None;
                 Ok(Some(DisplayUpdate::DefaultPointer))
@@ -604,7 +682,14 @@ impl MacDisplayUpdates {
     /// Returns `None` for PixelBuffer frames, no/too-large dirty rects, or extraction failure.
     fn try_uncompressed(&mut self, frame: &CapturedFrame, full: bool) -> Option<DisplayUpdate> {
         let whole = macrdp_capture::Rect { x: 0, y: 0, width: frame.width, height: frame.height };
-        let dirty_rects: &[macrdp_capture::Rect] = if full && (frame.dirty_rects.is_empty() || self.display_frame_count == 0) {
+        let whole_frame = full && (frame.dirty_rects.is_empty() || self.display_frame_count == 0);
+        if whole_frame {
+            if self.last_full_uncompressed.is_some_and(|t| t.elapsed() < FULL_UNCOMPRESSED_MIN_INTERVAL) {
+                return Some(DisplayUpdate::DefaultPointer);
+            }
+            self.last_full_uncompressed = Some(Instant::now());
+        }
+        let dirty_rects: &[macrdp_capture::Rect] = if whole_frame {
             std::slice::from_ref(&whole)
         } else {
             &frame.dirty_rects
@@ -687,6 +772,19 @@ impl MacDisplayUpdates {
             return Ok(Some(DisplayUpdate::DefaultPointer));
         }
 
+        // Late GFX negotiation: the DVC side still completes caps exchange after our bitmap
+        // fallback latched, and a client in GFX mode ignores legacy bitmaps (frozen screen).
+        // Switch over with a fresh whole frame / keyframe.
+        if self.bitmap_fallback && self.gfx_state.lock().unwrap().is_ready() {
+            tracing::info!("GFX channel negotiated after bitmap fallback — switching to GFX");
+            self.bitmap_fallback = false;
+            self.keyframe_requested = true;
+            self.display_frame_count = 0;
+            if let Some(enc) = &mut self.encoder {
+                enc.force_keyframe();
+            }
+        }
+
         // GFX negotiated ≠ H.264 capable: `is_ready()` only means the channel is open and caps
         // confirmed; `GfxFrame` needs `avc420_supported()`, otherwise go uncompressed.
         let (gfx_ready, use_h264, use_444, pending_acks) = {
@@ -704,7 +802,7 @@ impl MacDisplayUpdates {
             if let Some(update) = self.try_uncompressed(&frame, true) {
                 return Ok(Some(update));
             }
-            tracing::warn!("GFX client without AVC420 and frame is not BGRA — dropping frame");
+            macrdp_encode::warn_limited!("GFX client without AVC420 and frame is not BGRA — dropping frame");
             return Ok(Some(DisplayUpdate::DefaultPointer));
         }
 
@@ -735,7 +833,7 @@ impl MacDisplayUpdates {
             // ── Pipelining fast-path (checked BEFORE borrowing encoder long-term) ──
             // Check pipelining support with a short borrow, then handle collect/submit
             // using &mut self methods that don't conflict with the encoder borrow.
-            let supports_pipeline = self.encoder.as_ref().map_or(false, |e| e.supports_pipelining());
+            let supports_pipeline = self.encoder.as_ref().is_some_and(|e| e.supports_pipelining());
 
             // AVC444 stays synchronous — only pipeline AVC420 (PixelBuffer or BGRA).
             let pipeline_444 = matches!(frame.data, FrameData::Raw(_))
@@ -838,11 +936,11 @@ impl MacDisplayUpdates {
                                 })));
                             }
                             Ok(_) => {
-                                tracing::warn!("Zero-copy encode returned empty data");
+                                macrdp_encode::warn_limited!("Zero-copy encode returned empty data");
                                 return Ok(Some(DisplayUpdate::DefaultPointer));
                             }
                             Err(e) => {
-                                tracing::warn!("Zero-copy encode failed: {e}, falling back to DefaultPointer");
+                                macrdp_encode::warn_limited!("Zero-copy encode failed: {e}, falling back to DefaultPointer");
                                 return Ok(Some(DisplayUpdate::DefaultPointer));
                             }
                         }
@@ -913,14 +1011,14 @@ impl MacDisplayUpdates {
                             })));
                         }
                         Ok(_) => {
-                            tracing::warn!(
+                            macrdp_encode::warn_limited!(
                                 display_frame = self.display_frame_count,
                                 "AVC444 encode returned EMPTY data — frame dropped!"
                             );
                             return Ok(Some(DisplayUpdate::DefaultPointer));
                         }
                         Err(e) => {
-                            tracing::warn!(display_frame = self.display_frame_count, "AVC444 encode failed: {e}, falling back to AVC420");
+                            macrdp_encode::warn_limited!(display_frame = self.display_frame_count, "AVC444 encode failed: {e}, falling back to AVC420");
                             // Fall through to AVC420 path below
                         }
                     }
@@ -930,16 +1028,9 @@ impl MacDisplayUpdates {
                 // OpenH264 is a synchronous CPU encode (~tens of ms); run it on the blocking
                 // pool so the single-threaded server runtime keeps handling input/ACKs meanwhile.
                 let encoded = {
-                    let mut enc = self.encoder.take().unwrap();
                     let FrameData::Raw(raw) = &frame.data else { unreachable!("Raw checked above") };
                     let (data, w, h, stride) = (raw.clone(), frame.width, frame.height, frame.stride);
-                    let (enc, result) = tokio::task::spawn_blocking(move || {
-                        let r = enc.encode_bgra(&data, w, h, stride);
-                        (enc, r)
-                    })
-                    .await?;
-                    self.encoder = Some(enc);
-                    result
+                    self.with_encoder_blocking(move |enc| enc.encode_bgra(&data, w, h, stride)).await
                 };
                 match encoded {
                     Ok(encoded) if !encoded.data.is_empty() => {
@@ -997,14 +1088,14 @@ impl MacDisplayUpdates {
                         })));
                     }
                     Ok(_) => {
-                        tracing::warn!(
+                        macrdp_encode::warn_limited!(
                             display_frame = self.display_frame_count,
                             "H.264 encode returned EMPTY data — frame dropped!"
                         );
                         return Ok(Some(DisplayUpdate::DefaultPointer));
                     }
                     Err(e) => {
-                        tracing::warn!(display_frame = self.display_frame_count, "H.264 encode failed: {e}");
+                        macrdp_encode::warn_limited!(display_frame = self.display_frame_count, "H.264 encode failed: {e}");
                         return Ok(Some(DisplayUpdate::DefaultPointer));
                     }
                 }
@@ -1028,7 +1119,7 @@ impl MacDisplayUpdates {
         let bgra_bitmap = match &frame.data {
             FrameData::Raw(bytes) => bytes,
             FrameData::PixelBuffer(_) => {
-                tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
+                macrdp_encode::warn_limited!("PixelBuffer frame in bitmap path — should not happen");
                 return Ok(Some(DisplayUpdate::DefaultPointer));
             }
         };

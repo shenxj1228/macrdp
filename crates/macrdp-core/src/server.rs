@@ -119,12 +119,14 @@ impl ServerHandle {
 
     /// Gracefully stop the server.
     pub async fn stop(&self) -> Result<()> {
-        if self.stopped.swap(true, Ordering::Relaxed) {
-            return Ok(()); // Already stopped
+        // `stopped` is also set by the server thread when it exits on its own, so do not
+        // early-return on it: the join/abort below must still run (handles are `take()`n,
+        // so a second call is a no-op).
+        if !self.stopped.swap(true, Ordering::Relaxed) {
+            // notify_one stores a permit, so the signal is not lost if the server
+            // thread has not reached `notified().await` yet.
+            self.shutdown_notify.notify_one();
         }
-        // notify_one stores a permit, so the signal is not lost if the server
-        // thread has not reached `notified().await` yet.
-        self.shutdown_notify.notify_one();
 
         // Extract thread handle from mutex *before* the await point so that
         // the MutexGuard is dropped and the future remains Send.
