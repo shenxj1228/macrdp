@@ -30,8 +30,14 @@ A native RDP server for macOS. Remote into your Mac from Windows, Linux, iOS, or
 
 ## Requirements
 
-- **macOS 14+** (Sonoma or later)
+- **macOS 14+** (Sonoma or later, required by ScreenCaptureKit)
 - **Rust 1.75+**
+- **Full Xcode 15+** (Command Line Tools alone is not enough), selected as the active developer directory:
+  ```bash
+  sudo xcode-select -s /Applications/Xcode.app
+  ```
+  The `screencapturekit` crate's build.rs runs `swift build --scratch-path`, which needs the Swift 5.7+ toolchain bundled with Xcode.
+  Do not use a swiftly-installed Swift 5.5, and do not set `DYLD_LIBRARY_PATH` to Xcode's `swift-5.5` back-deploy libraries in your shell: it leaks into rustc / build-script subprocesses and causes libdispatch assertion crashes on macOS 26, `swift build` link failures, or `rustc -vV` failing to find `libswiftCore.dylib`.
 - Screen Recording permission (System Settings > Privacy & Security)
 - Accessibility permission (for keyboard/mouse injection)
 

@@ -72,8 +72,17 @@ APP_BUNDLE := macrdp-ui/src-tauri/target/release/bundle/macos/macrdp.app
 # Tauri 自动签名：设置此环境变量后 tauri build 会自动 codesign
 export APPLE_SIGNING_IDENTITY := $(SIGN_IDENTITY)
 
+# 预检签名证书：确保 Keychain 已解锁且证书可读
+check-sign:
+	@echo "检查签名证书 $(SIGN_IDENTITY) ..."
+	@security find-identity -v -p codesigning | grep -q "$(SIGN_IDENTITY)" \
+		|| (echo "错误: 未找到签名证书 $(SIGN_IDENTITY)"; exit 1)
+	@echo "尝试读取证书私钥（可能弹出密码输入框）..."
+	@security unlock-keychain login.keychain 2>/dev/null || true
+	@echo "签名证书就绪."
+
 # 完整发布：全优化编译 + 自动签名 + 打包 dmg
-release:
+release: check-sign
 	@echo "=== 完整发布构建 (签名: $(SIGN_IDENTITY)) ==="
 	cd macrdp-ui && MACRDP_CLI_PROFILE=release npm run tauri -- build
 	@echo ""
@@ -81,7 +90,7 @@ release:
 	@ls -lh macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
 
 # 快速发布：关闭优化 + 自动签名 + 打包 dmg
-release-fast:
+release-fast: check-sign
 	@echo "=== 快速发布构建 (签名: $(SIGN_IDENTITY)) ==="
 	cd macrdp-ui && MACRDP_CLI_PROFILE=debug npm run tauri -- build
 	@echo ""

@@ -30,8 +30,14 @@
 
 ## 环境要求
 
-- **macOS 14+**（Sonoma 或更高版本）
+- **macOS 14+**（Sonoma 或更高版本，ScreenCaptureKit 所需）
 - **Rust 1.75+**
+- **完整 Xcode 15+**（仅 Command Line Tools 不够），并切换为活动开发者目录：
+  ```bash
+  sudo xcode-select -s /Applications/Xcode.app
+  ```
+  `screencapturekit` crate 的 build.rs 会执行 `swift build --scratch-path`，需要 Xcode 自带的 Swift 5.7+。
+  不要使用 swiftly 安装的 Swift 5.5，也不要在 shell 里设置 `DYLD_LIBRARY_PATH` 指向 Xcode 的 `swift-5.5` 回溯部署库——它会污染 rustc / build script 子进程，导致 macOS 26 上 libdispatch 断言崩溃、`swift build` 链接失败或 `rustc -vV` 找不到 `libswiftCore.dylib`。
 - 屏幕录制权限（系统设置 > 隐私与安全性）
 - 辅助功能权限（用于键盘鼠标注入）
 
