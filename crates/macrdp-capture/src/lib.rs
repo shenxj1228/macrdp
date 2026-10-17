@@ -113,14 +113,19 @@ pub struct CaptureConfig {
 
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
-    stream: SCStream,
+    stream: Arc<SCStream>,
     frame_rx: mpsc::Receiver<CaptureEvent>,
 }
 
 struct VideoOutputHandler {
     frame_tx: mpsc::Sender<CaptureEvent>,
     pixel_format: CapturePixelFormat,
+    /// Frames dropped because the channel was full (consumer slower than capture).
+    dropped: std::sync::atomic::AtomicU64,
 }
+
+/// Log one debug line per this many dropped frames.
+const DROP_LOG_EVERY: u64 = 60;
 
 struct AudioOutputHandler {
     audio_tx: Arc<mpsc::Sender<AudioFrame>>,
@@ -139,7 +144,14 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         let Some(event) = event else { return };
 
         // Non-blocking send — drop frame if channel is full
-        let _ = self.frame_tx.try_send(event);
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.frame_tx.try_send(event) {
+            let n = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // `is_multiple_of` needs Rust 1.87; workspace MSRV is 1.75
+            #[allow(clippy::manual_is_multiple_of)]
+            if n % DROP_LOG_EVERY == 0 {
+                tracing::debug!(dropped = n, "Capture channel full — frames dropped");
+            }
+        }
     }
 }
 
@@ -429,11 +441,23 @@ impl ScreenCapturer {
 
         let frame_interval = CMTime::new(1, config.frame_rate as i32);
 
+        // Only ask SCK to rescale when the requested size differs from the display's
+        // physical pixel size — otherwise it is a pointless GPU resample pass.
+        let cg_main = core_graphics::display::CGDisplay::main();
+        let needs_scale = actual_width != cg_main.pixels_wide() as u32
+            || actual_height != cg_main.pixels_high() as u32;
+
         let captures_audio = audio_tx.is_some();
         let stream_config = SCStreamConfiguration::new()
             .with_width(actual_width)
             .with_height(actual_height)
-            .with_scales_to_fit(true)
+            .with_scales_to_fit(needs_scale)
+            // Depth 2 instead of default 3: one fewer buffered frame (~1 frame interval less latency)
+            .with_queue_depth(2)
+            // Match the encoder: BT.601 matrix, sRGB primaries.
+            // Values are the CFString contents of kCGDisplayStreamYCbCrMatrix_ITU_R_601_4 / kCGColorSpaceSRGB.
+            .with_color_matrix("ITU_R_601_4")
+            .with_color_space_name("kCGColorSpaceSRGB")
             .with_minimum_frame_interval(&frame_interval)
             .with_pixel_format(match config.pixel_format {
                 CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
@@ -452,6 +476,7 @@ impl ScreenCapturer {
         let video_handler = VideoOutputHandler {
             frame_tx,
             pixel_format: config.pixel_format,
+            dropped: std::sync::atomic::AtomicU64::new(0),
         };
 
         let mut stream = SCStream::new(&filter, &stream_config);
@@ -473,11 +498,12 @@ impl ScreenCapturer {
             fps = config.frame_rate,
             pixel_format = ?config.pixel_format,
             audio = captures_audio,
+            scales_to_fit = needs_scale,
             "Screen capture started"
         );
 
         Ok(Self {
-            stream,
+            stream: Arc::new(stream),
             frame_rx,
         })
     }
@@ -493,20 +519,29 @@ impl ScreenCapturer {
     }
 
     /// Update capture frame rate at runtime.
-    /// Note: SCStream::update_configuration() blocks until completion via internal semaphore.
+    /// Note: SCStream::update_configuration() blocks (unbounded condvar wait) until SCK
+    /// invokes the completion handler. Prefer [`Self::set_frame_rate_async`] from tokio tasks.
     pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
-        use screencapturekit::cm::CMTime;
-        use screencapturekit::prelude::SCStreamConfiguration;
-
-        let interval = CMTime::new(1, fps as i32);
-        let mut config = SCStreamConfiguration::new();
-        config.set_minimum_frame_interval(&interval);
-        self.stream
-            .update_configuration(&config)
-            .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
-        tracing::info!(fps, "Capture frame rate updated");
-        Ok(())
+        apply_frame_rate(&self.stream, fps)
     }
+
+    /// Same as [`Self::set_frame_rate`] but runs the blocking SCK call on
+    /// `spawn_blocking`, so it never stalls a tokio worker thread.
+    pub async fn set_frame_rate_async(&self, fps: u32) -> anyhow::Result<()> {
+        let stream = Arc::clone(&self.stream);
+        tokio::task::spawn_blocking(move || apply_frame_rate(&stream, fps)).await?
+    }
+}
+
+fn apply_frame_rate(stream: &SCStream, fps: u32) -> anyhow::Result<()> {
+    let interval = CMTime::new(1, fps as i32);
+    let mut config = SCStreamConfiguration::new();
+    config.set_minimum_frame_interval(&interval);
+    stream
+        .update_configuration(&config)
+        .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
+    tracing::info!(fps, "Capture frame rate updated");
+    Ok(())
 }
 
 /// Fallback capturer using CGDisplayCreateImage (CoreGraphics).
@@ -532,22 +567,25 @@ impl CgFallbackCapturer {
         }
     }
 
-    /// Capture a single frame using CGDisplayCreateImage
+    /// Capture a single frame using CGDisplayCreateImage.
+    ///
+    /// `CGDisplayCreateImage` always returns the display's physical pixel size. When the
+    /// configured size differs (Retina + client-chosen resolution) the image is rescaled
+    /// to the configured size so `width/height/stride/data` stay consistent for the encoder.
     pub fn capture_frame(&self) -> Option<CapturedFrame> {
         let display = core_graphics::display::CGDisplay::new(self.display_id);
         let image = display.image()?;
 
-        let w = image.width() as u32;
-        let h = image.height() as u32;
-        let bpr = image.bytes_per_row();
-        let data = image.data();
-        let raw = data.bytes().to_vec();
+        let target_w = if self.width > 0 { self.width } else { image.width() as u32 };
+        let target_h = if self.height > 0 { self.height } else { image.height() as u32 };
+
+        let (raw, stride) = cg_image_to_bgra(&image, target_w, target_h)?;
 
         Some(CapturedFrame {
-            width: if self.width > 0 { self.width } else { w },
-            height: if self.height > 0 { self.height } else { h },
+            width: target_w,
+            height: target_h,
             data: FrameData::Raw(Bytes::from(raw)),
-            stride: bpr,
+            stride,
             timestamp_us: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -559,6 +597,116 @@ impl CgFallbackCapturer {
     /// Frame interval for pacing
     pub fn frame_interval(&self) -> std::time::Duration {
         self.frame_interval
+    }
+}
+
+/// Convert a CGImage to tightly-packed BGRA at `width`x`height`.
+/// Returns `(pixels, stride)`. If the image already matches, its bytes are copied as-is
+/// (keeping CG's row stride); otherwise it is drawn through a CGBitmapContext, which rescales.
+fn cg_image_to_bgra(
+    image: &core_graphics::image::CGImage,
+    width: u32,
+    height: u32,
+) -> Option<(Vec<u8>, usize)> {
+    use core_graphics::base::{kCGBitmapByteOrder32Little, kCGImageAlphaPremultipliedFirst};
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::{CGContext, CGInterpolationQuality};
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    if image.width() as u32 == width
+        && image.height() as u32 == height
+        && image.bits_per_pixel() == 32
+    {
+        return Some((image.data().bytes().to_vec(), image.bytes_per_row()));
+    }
+
+    let stride = width as usize * 4;
+    let mut buf = vec![0u8; stride * height as usize];
+    {
+        // Context borrows `buf` as its backing store; it is dropped before `buf` is returned.
+        let ctx = CGContext::create_bitmap_context(
+            Some(buf.as_mut_ptr() as *mut c_void),
+            width as usize,
+            height as usize,
+            8,
+            stride,
+            &CGColorSpace::create_device_rgb(),
+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little, // BGRA in memory
+        );
+        ctx.set_interpolation_quality(CGInterpolationQuality::CGInterpolationQualityLow);
+        ctx.draw_image(
+            CGRect::new(
+                &CGPoint::new(0.0, 0.0),
+                &CGSize::new(width as f64, height as f64),
+            ),
+            image,
+        );
+        ctx.flush();
+    }
+    Some((buf, stride))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_graphics::base::{kCGBitmapByteOrder32Little, kCGImageAlphaPremultipliedFirst};
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_graphics::image::CGImage;
+
+    /// Build a solid-colour BGRA CGImage of the given size (no screen access needed).
+    fn solid_image(w: usize, h: usize, bgra: [u8; 4]) -> CGImage {
+        let stride = w * 4;
+        let mut px = Vec::with_capacity(stride * h);
+        for _ in 0..w * h {
+            px.extend_from_slice(&bgra);
+        }
+        let mut ctx = CGContext::create_bitmap_context(
+            None,
+            w,
+            h,
+            8,
+            stride,
+            &CGColorSpace::create_device_rgb(),
+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
+        );
+        ctx.data().copy_from_slice(&px);
+        ctx.create_image().unwrap()
+    }
+
+    #[test]
+    fn fallback_frame_scales_physical_to_configured_size() {
+        // "Retina" physical 64x48 vs configured 32x24
+        let img = solid_image(64, 48, [10, 20, 30, 255]);
+        let (data, stride) = cg_image_to_bgra(&img, 32, 24).unwrap();
+        assert!(stride >= 32 * 4);
+        assert!(data.len() >= stride * 24);
+        // Every pixel must be the same colour as the source — proves scaling, not cropping.
+        for row in 0..24 {
+            for x in 0..32 {
+                let o = row * stride + x * 4;
+                assert_eq!(&data[o..o + 4], &[10, 20, 30, 255], "pixel ({x},{row})");
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_frame_passthrough_when_sizes_match() {
+        let img = solid_image(16, 8, [1, 2, 3, 255]);
+        let (data, stride) = cg_image_to_bgra(&img, 16, 8).unwrap();
+        assert!(stride >= 16 * 4);
+        assert!(data.len() >= stride * 8);
+        assert_eq!(&data[0..4], &[1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn fallback_rejects_zero_size() {
+        let img = solid_image(4, 4, [0; 4]);
+        assert!(cg_image_to_bgra(&img, 0, 4).is_none());
     }
 }
 
