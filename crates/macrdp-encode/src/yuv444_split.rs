@@ -53,17 +53,11 @@ impl Yuv420Frame {
     }
 }
 
-/// Convert a BGRA frame to full-resolution YUV444 planes using BT.601 **full range**.
+/// Convert a BGRA frame to full-resolution YUV444 planes (BT.601, crate-wide range —
+/// see [`crate::LIMITED_RANGE`]). Output row stride equals `width`.
 ///
 /// The output planes `y444`, `u444`, `v444` must each be at least `width * height` bytes.
 /// BGRA byte order: B[0], G[1], R[2], A[3].
-///
-/// BT.601 full range (Y: 0-255, UV: 0-255) — matches NV12 '420f' format:
-/// ```text
-/// Y =  (77*R + 150*G + 29*B) >> 8
-/// U = (-43*R -  85*G + 128*B) >> 8 + 128
-/// V = (128*R - 107*G -  21*B) >> 8 + 128
-/// ```
 pub fn bgra_to_yuv444(
     bgra: &[u8],
     width: u32,
@@ -73,30 +67,43 @@ pub fn bgra_to_yuv444(
     u444: &mut [u8],
     v444: &mut [u8],
 ) {
+    bgra_to_yuv444_strided(bgra, width, height, stride, width as usize, y444, u444, v444);
+}
+
+/// Like [`bgra_to_yuv444`] but writes rows with `dst_stride` bytes between them, so a
+/// `width × height` frame can be placed into planes sized for an aligned encoder width.
+/// Pixels beyond `width` in each row (the padding) are left untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn bgra_to_yuv444_strided(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    dst_stride: usize,
+    y444: &mut [u8],
+    u444: &mut [u8],
+    v444: &mut [u8],
+) {
     let w = width as usize;
     let h = height as usize;
-    debug_assert!(y444.len() >= w * h);
-    debug_assert!(u444.len() >= w * h);
-    debug_assert!(v444.len() >= w * h);
+    debug_assert!(dst_stride >= w);
+    debug_assert!(y444.len() >= dst_stride * h);
+    debug_assert!(u444.len() >= dst_stride * h);
+    debug_assert!(v444.len() >= dst_stride * h);
 
     for row in 0..h {
         let bgra_row = row * stride;
-        let yuv_row = row * w;
+        let yuv_row = row * dst_stride;
         for col in 0..w {
             let px = bgra_row + col * 4;
             let b = bgra[px] as i32;
             let g = bgra[px + 1] as i32;
             let r = bgra[px + 2] as i32;
-
-            // BT.601 full range (no +16 offset on Y, full 0-255 range)
-            let y = (77 * r + 150 * g + 29 * b) >> 8;
-            let u = ((-43 * r - 85 * g + 128 * b) >> 8) + 128;
-            let v = ((128 * r - 107 * g - 21 * b) >> 8) + 128;
-
+            let (u, v) = crate::bt601_uv(r, g, b);
             let idx = yuv_row + col;
-            y444[idx] = y.clamp(0, 255) as u8;
-            u444[idx] = u.clamp(0, 255) as u8;
-            v444[idx] = v.clamp(0, 255) as u8;
+            y444[idx] = crate::bt601_y(r, g, b);
+            u444[idx] = u;
+            v444[idx] = v;
         }
     }
 }
@@ -132,7 +139,7 @@ pub fn yuv444_split_to_yuv420(
     let half_w = w / 2;
     let half_h = h / 2;
 
-    debug_assert!(w % 2 == 0 && h % 2 == 0, "width and height must be even");
+    debug_assert!(w.is_multiple_of(2) && h.is_multiple_of(2), "width and height must be even");
     debug_assert!(main_view.y.len() >= w * h);
     debug_assert!(main_view.u.len() >= half_w * half_h);
     debug_assert!(aux_view.y.len() >= w * h);
@@ -226,15 +233,10 @@ mod tests {
         buf
     }
 
-    /// Reference BT.601 full-range conversion for a single pixel
+    /// Reference conversion for a single pixel (shared crate-wide scalar path)
     fn ref_bt601(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-        let ri = r as i32;
-        let gi = g as i32;
-        let bi = b as i32;
-        let y = ((77 * ri + 150 * gi + 29 * bi) >> 8).clamp(0, 255) as u8;
-        let u = (((-43 * ri - 85 * gi + 128 * bi) >> 8) + 128).clamp(0, 255) as u8;
-        let v = (((128 * ri - 107 * gi - 21 * bi) >> 8) + 128).clamp(0, 255) as u8;
-        (y, u, v)
+        let (u, v) = crate::bt601_uv(r as i32, g as i32, b as i32);
+        (crate::bt601_y(r as i32, g as i32, b as i32), u, v)
     }
 
     #[test]
@@ -520,5 +522,44 @@ mod tests {
         // B6/B7: picking any column from uniform data = same value
         assert!(aux_view.u.iter().all(|&v| v == exp_u), "uniform B6 check");
         assert!(aux_view.v.iter().all(|&v| v == exp_v), "uniform B7 check");
+    }
+
+    /// B1: a 1366-wide frame written into align16 (1376) planes must land on 1376-stride rows,
+    /// so the split (which reads with the aligned stride) sees every row where it expects it.
+    #[test]
+    fn test_strided_write_non_multiple_of_16_width() {
+        let (w, h) = (1366u32, 768u32);
+        let enc_w = crate::align16(w); // 1376
+        let enc_h = crate::align16(h); // 768
+        assert_eq!(enc_w, 1376);
+        let stride = w as usize * 4;
+        let mut bgra = vec![0u8; stride * h as usize];
+        // Each row r gets a distinct gray level so rows are distinguishable
+        for row in 0..h as usize {
+            let gray = (row % 200 + 20) as u8;
+            for col in 0..w as usize {
+                let px = row * stride + col * 4;
+                bgra[px..px + 4].copy_from_slice(&[gray, gray, gray, 255]);
+            }
+        }
+        let full = (enc_w * enc_h) as usize;
+        let (mut y444, mut u444, mut v444) = (vec![0u8; full], vec![128u8; full], vec![128u8; full]);
+        bgra_to_yuv444_strided(&bgra, w, h, stride, enc_w as usize, &mut y444, &mut u444, &mut v444);
+
+        let mut main_view = Yuv420Frame::new(enc_w, enc_h);
+        let mut aux_view = Yuv420Frame::new(enc_w, enc_h);
+        yuv444_split_to_yuv420(&y444, &u444, &v444, enc_w, enc_h, &mut main_view, &mut aux_view);
+
+        let ew = enc_w as usize;
+        for row in [0usize, 1, 7, 100, 511, 767] {
+            let gray = (row % 200 + 20) as i32;
+            let exp = crate::bt601_y(gray, gray, gray);
+            // first, middle and last visible pixel of the row sit at row*1376 + col
+            for col in [0usize, 683, 1365] {
+                assert_eq!(main_view.y[row * ew + col], exp, "main Y row {row} col {col}");
+            }
+            // padding columns 1366..1375 untouched (still 0)
+            assert_eq!(main_view.y[row * ew + 1366], 0, "padding row {row} must be untouched");
+        }
     }
 }

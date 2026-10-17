@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::color_convert::VImageConverter;
-use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
+use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder, LIMITED_RANGE};
 
 // --- FFI declarations ---
 
@@ -36,10 +36,6 @@ impl CMTime {
     fn make(value: i64, timescale: i32) -> Self {
         Self { value, timescale, flags: 1, epoch: 0 } // flags=1 = valid
     }
-    #[allow(dead_code)]
-    fn invalid() -> Self {
-        Self { value: 0, timescale: 0, flags: 0, epoch: 0 }
-    }
 }
 
 type VTCompressionOutputCallback = extern "C" fn(
@@ -54,7 +50,7 @@ type VTCompressionOutputCallback = extern "C" fn(
 #[link(name = "CoreMedia", kind = "framework")]
 #[link(name = "CoreVideo", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::duplicated_attributes)]
 extern "C" {
     fn VTCompressionSessionCreate(
         allocator: CFAllocatorRef, width: i32, height: i32, codec_type: u32,
@@ -149,6 +145,7 @@ extern "C" {
     static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
     static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
     static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
+    static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
     static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
     static kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel: CFStringRef;
     static kVTH264EntropyMode_CABAC: CFStringRef;
@@ -176,18 +173,16 @@ extern "C" {
     static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
     static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
     static kCMFormatDescriptionExtension_FullRangeVideo: CFStringRef;
+    static kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4: CFStringRef;
 }
 
 // CFNumber types
 const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
 const K_CF_NUMBER_FLOAT64_TYPE: i64 = 13;
 
-// Pixel format: BGRA
-const K_CV_PIXEL_FORMAT_32BGRA: u32 = 0x42475241; // 'BGRA'
-
-// Pixel format: NV12 (420f — YUV 4:2:0 biplanar, full range)
-// Full range (Y: 0-255) avoids the washed-out look of video range (Y: 16-235)
-const K_CV_PIXEL_FORMAT_420F: u32 = 0x34323066; // '420f'
+// Pixel format: NV12 biplanar, tagged to match the crate-wide range (see `LIMITED_RANGE`):
+// '420v' (video range, Y 16-235) or '420f' (full range, Y 0-255).
+const K_CV_PIXEL_FORMAT_NV12: u32 = if LIMITED_RANGE { 0x34323076 } else { 0x34323066 };
 
 // H.264 codec type
 const K_CM_VIDEO_CODEC_TYPE_H264: u32 = 0x61766331; // 'avc1'
@@ -221,7 +216,7 @@ extern "C" fn encode_callback(
         return;
     }
 
-    let mut annex_b = Vec::new();
+    let mut annex_b;
     let mut is_keyframe = false;
 
     unsafe {
@@ -230,6 +225,8 @@ extern "C" fn encode_callback(
         if block_buf.is_null() { return; }
 
         let total_len = CMBlockBufferGetDataLength(block_buf);
+        // One exact allocation: Annex B output is ≈ AVCC input (+ SPS/PPS on IDR)
+        annex_b = Vec::with_capacity(total_len + 128);
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut length: usize = 0;
         if CMBlockBufferGetDataPointer(block_buf, 0, &mut length, std::ptr::null_mut(), &mut data_ptr) != 0 {
@@ -336,40 +333,22 @@ impl Yuv444Buffers {
         let full = (width * height) as usize;
         Self {
             y444: vec![0u8; full],
-            u444: vec![0u8; full],
-            v444: vec![0u8; full],
+            // Padding columns are never written: keep them neutral (black / no chroma)
+            u444: vec![128u8; full],
+            v444: vec![128u8; full],
             main_view: crate::yuv444_split::Yuv420Frame::new(width, height),
             aux_view: crate::yuv444_split::Yuv420Frame::new(width, height),
         }
     }
 }
 
-/// Send-safe pointer wrappers for multi-threaded NV12 conversion.
-/// Safety: callers ensure the pointed-to memory is valid and disjoint per thread.
-#[derive(Clone, Copy)]
-struct SendPtr(usize);
-#[derive(Clone, Copy)]
-struct SendPtrMut(usize);
-unsafe impl Send for SendPtr {}
-unsafe impl Send for SendPtrMut {}
-unsafe impl Sync for SendPtr {}
-unsafe impl Sync for SendPtrMut {}
-impl SendPtr {
-    fn from(p: *const u8) -> Self { Self(p as usize) }
-    unsafe fn add(self, off: usize) -> *const u8 { (self.0 + off) as *const u8 }
-}
-impl SendPtrMut {
-    fn from(p: *mut u8) -> Self { Self(p as usize) }
-    unsafe fn add(self, off: usize) -> *mut u8 { (self.0 + off) as *mut u8 }
-}
-
 // --- Encoder ---
 
 pub struct VtEncoder {
     session: VTCompressionSessionRef,
-    session_aux: Option<VTCompressionSessionRef>,
     callback_ctx: Arc<CallbackCtx>,
-    callback_ctx_aux: Option<Arc<CallbackCtx>>,
+    /// H.264 profile the session accepted (High → Main → Baseline fallback)
+    profile: &'static str,
     width: u32,
     height: u32,
     frame_count: u64,
@@ -395,13 +374,10 @@ impl VtEncoder {
             has_data: std::sync::atomic::AtomicBool::new(false),
         });
 
-        // NV12 full-range input for both AVC420 and AVC444.
-        // BGRA input produces video range (16-235) causing washed-out colors.
-        let session = Self::create_session(width, height, fps, bitrate, &callback_ctx, K_CV_PIXEL_FORMAT_420F)?;
-
-        // AVC444: single session, no aux session. Both streams use the same encoder
-        // per MS-RDPEGFX requirement: "MUST be encoded using the same encoder".
-        let (session_aux, callback_ctx_aux) = (None::<VTCompressionSessionRef>, None::<Arc<CallbackCtx>>);
+        // NV12 input for both AVC420 and AVC444 (range per `LIMITED_RANGE`).
+        // AVC444 uses this single session for both streams, per MS-RDPEGFX
+        // ("MUST be encoded using the same encoder").
+        let (session, profile) = Self::create_session(width, height, fps, bitrate, &callback_ctx, K_CV_PIXEL_FORMAT_NV12)?;
 
         let yuv444_buf = if mode_444 {
             Some(Yuv444Buffers::new(width, height))
@@ -417,16 +393,15 @@ impl VtEncoder {
         let nv12_uv_buf = vec![0u8; (width * height / 2) as usize];
 
         tracing::info!(
-            width, height, fps, mode_444,
+            width, height, fps, mode_444, profile,
             bitrate_mbps = bitrate as f64 / 1_000_000.0,
             "VideoToolbox hardware encoder created"
         );
 
         Ok(Self {
             session,
-            session_aux,
             callback_ctx,
-            callback_ctx_aux,
+            profile,
             width,
             height,
             frame_count: 0,
@@ -446,13 +421,14 @@ impl VtEncoder {
         width: u32, height: u32, fps: f32, bitrate: u32,
         callback_ctx: &Arc<CallbackCtx>,
         pixel_format: u32,
-    ) -> Result<VTCompressionSessionRef> {
+    ) -> Result<(VTCompressionSessionRef, &'static str)> {
         let mut session: VTCompressionSessionRef = std::ptr::null_mut();
+        let profile;
 
         unsafe {
-            // Hardware acceleration + low-latency rate control.
-            // Low-latency RC produces clean first keyframes and adapts QP per-frame.
-            // AverageBitRate serves as a target hint for its internal algorithm.
+            // Hardware acceleration + low-latency rate control (EnableLowLatencyRateControl).
+            // Low-latency RC adapts QP per frame and treats AverageBitRate as its target;
+            // DataRateLimits below caps bursts so a keyframe cannot blow the LAN budget.
             let spec_keys = [
                 kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
                 kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
@@ -500,14 +476,35 @@ impl VtEncoder {
                 anyhow::bail!("VTCompressionSessionCreate failed: {status}");
             }
 
-            // Constrained Baseline Profile — compatible with Apple Silicon hardware encoder
-            // in low-latency mode. High Profile causes null sample_buffer (frame drops) on
-            // Apple Silicon with RequireHardwareAccelerated + EnableLowLatencyRateControl.
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel);
-            // Explicit CAVLC entropy mode (required for Constrained Baseline)
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_H264EntropyMode,
-                kVTH264EntropyMode_CAVLC);
+            // Profile: prefer High (CABAC, 8x8 transform — best text quality per bit), fall back
+            // to Main then Baseline if the low-latency hardware encoder rejects it.
+            // Each VTSessionSetProperty return code is checked; the accepted one is logged.
+            let candidates: [(CFStringRef, CFStringRef, &'static str); 3] = [
+                (kVTProfileLevel_H264_High_AutoLevel, kVTH264EntropyMode_CABAC, "High"),
+                (kVTProfileLevel_H264_Main_AutoLevel, kVTH264EntropyMode_CABAC, "Main"),
+                (kVTProfileLevel_H264_Baseline_AutoLevel, kVTH264EntropyMode_CAVLC, "Baseline"),
+            ];
+            let mut accepted = None;
+            for (level, entropy, name) in candidates {
+                let st = VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel, level);
+                if st != 0 {
+                    tracing::warn!(status = st, profile = name, "VT rejected H.264 profile, trying next");
+                    continue;
+                }
+                let st = VTSessionSetProperty(session, kVTCompressionPropertyKey_H264EntropyMode, entropy);
+                if st != 0 {
+                    tracing::warn!(status = st, profile = name, "VT rejected entropy mode, keeping encoder default");
+                }
+                accepted = Some(name);
+                break;
+            }
+            profile = match accepted {
+                Some(name) => name,
+                None => {
+                    VTCompressionSessionInvalidate(session);
+                    anyhow::bail!("VT accepted none of High/Main/Baseline H.264 profiles");
+                }
+            };
             // Low-latency: no frame reordering, no B-frames, zero delay
             VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
@@ -516,339 +513,198 @@ impl VtEncoder {
             // Temporal compression (P-frames) — do NOT set ReferenceBufferCount
             // (on Apple Silicon, setting it to 1 forces all-IDR)
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
-            // Force full-range video output (Y: 0-255) to avoid washed-out colors.
-            // Without this, VT defaults to video range (Y: 16-235) which looks gray.
-            VTSessionSetProperty(session, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanTrue);
+            // Colour signalling must match what the converters produce: BT.601 matrix here; the
+            // range (VUI video_full_range_flag) is taken by VT from the NV12 pixel-format tag of
+            // the pool buffers ('420v'/'420f', see `K_CV_PIXEL_FORMAT_NV12`) — setting
+            // kCMFormatDescriptionExtension_FullRangeVideo on the session returns -12900 (unsupported).
+            let st = VTSessionSetProperty(session, kVTCompressionPropertyKey_YCbCrMatrix, kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4);
+            if st != 0 {
+                tracing::warn!(status = st, "VT rejected YCbCrMatrix=ITU_R_601_4");
+            }
 
-            // Rate control: AverageBitRate only (soft target).
-            // VT will aim for this average but allow bursts for keyframes.
-            // No DataRateLimits — hard ceiling starves first keyframe causing blur.
-            // No EnableLowLatencyRateControl — it ignores AverageBitRate entirely.
+            // Rate control: AverageBitRate target + a soft ceiling of 1.5× average per second.
             VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64));
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate as i32));
-            tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, "VT session bitrate set");
-            // IDR every 5 seconds — less frequent keyframes reduce bandwidth spikes
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 5));
-
-            // PrioritizeEncodingSpeedOverQuality (macOS 14+) — reduce encode latency
             {
-                let key_bytes = b"PrioritizeEncodingSpeedOverQuality\0";
-                let key = CFStringCreateWithCString(
-                    std::ptr::null(),
-                    key_bytes.as_ptr() as *const i8,
-                    0x08000100, // kCFStringEncodingUTF8
-                );
-                if !key.is_null() {
-                    VTSessionSetProperty(session, key, kCFBooleanTrue);
-                    CFRelease(key);
+                let bytes_per_sec = cf_i32((bitrate as f64 / 8.0 * 1.5) as i32);
+                let one_sec = cf_f64(1.0);
+                let limits = [bytes_per_sec, one_sec];
+                let arr = CFArrayCreate(std::ptr::null(), limits.as_ptr(), 2, &kCFTypeArrayCallBacks);
+                let st = VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
+                if st != 0 {
+                    tracing::warn!(status = st, "VT rejected DataRateLimits");
                 }
+                CFRelease(arr);
+                CFRelease(bytes_per_sec);
+                CFRelease(one_sec);
             }
+            tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, profile, "VT session configured");
+            // IDR every 10 seconds — P-frame chains keep bandwidth flat for static desktops
+            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 10));
 
             VTCompressionSessionPrepareToEncodeFrames(session);
         }
 
-        Ok(session)
+        Ok((session, profile))
     }
 
-    /// Fast BGRA→NV12 full-range conversion via session pool buffer.
-    /// Optimized: unsafe pointer math, no bounds checks, auto-vectorizable loops.
-    fn create_nv12_from_bgra_fast(
-        session: VTCompressionSessionRef,
-        enc_w: u32, enc_h: u32,
-        data: &[u8], src_w: u32, src_h: u32, stride: usize,
-    ) -> Result<CVPixelBufferRef> {
+    /// Lock an NV12 pool buffer and return (pb, y_base, y_bpr, uv_base, uv_bpr).
+    unsafe fn lock_pool_nv12(session: VTCompressionSessionRef) -> Result<(CVPixelBufferRef, *mut u8, usize, *mut u8, usize)> {
         let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        let w = enc_w as usize;
-        let h = enc_h as usize;
-        let sw = src_w.min(enc_w) as usize;
-        let sh = src_h.min(enc_h) as usize;
+        let pool = VTCompressionSessionGetPixelBufferPool(session);
+        if pool.is_null() { anyhow::bail!("VT pixel buffer pool is null"); }
+        let status = CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut pb);
+        if status != 0 || pb.is_null() { anyhow::bail!("Pool alloc failed: {status}"); }
 
-        unsafe {
-            let pool = VTCompressionSessionGetPixelBufferPool(session);
-            if pool.is_null() { anyhow::bail!("VT pixel buffer pool is null"); }
-            let status = CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut pb);
-            if status != 0 || pb.is_null() { anyhow::bail!("Pool alloc failed: {status}"); }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-            let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-
-            if y_base.is_null() || uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 plane is null");
-            }
-
-            // Single-pass BGRA→NV12: process row pairs (Y for 2 rows + UV for 1 row).
-            // Single-threaded: thread spawn/join overhead per frame exceeds savings.
-            let src = data.as_ptr();
-            let uv_w = sw / 2;
-            for pr in 0..(sh / 2) {
-                let r0 = pr * 2;
-                let r1 = r0 + 1;
-                let src_r0 = src.add(r0 * stride);
-                let src_r1 = src.add(r1 * stride);
-                let y_dst0 = y_base.add(r0 * y_bpr);
-                let y_dst1 = y_base.add(r1 * y_bpr);
-                let uv_dst = uv_base.add(pr * uv_bpr);
-
-                for col in 0..uv_w {
-                    let c0 = col * 2;
-                    let c1 = c0 + 1;
-                    let p00 = src_r0.add(c0 * 4);
-                    let p01 = src_r0.add(c1 * 4);
-                    let p10 = src_r1.add(c0 * 4);
-                    let p11 = src_r1.add(c1 * 4);
-
-                    let (b00, g00, r00) = (*p00 as i32, *p00.add(1) as i32, *p00.add(2) as i32);
-                    let (b01, g01, r01) = (*p01 as i32, *p01.add(1) as i32, *p01.add(2) as i32);
-                    let (b10, g10, r10) = (*p10 as i32, *p10.add(1) as i32, *p10.add(2) as i32);
-                    let (b11, g11, r11) = (*p11 as i32, *p11.add(1) as i32, *p11.add(2) as i32);
-
-                    *y_dst0.add(c0) = ((77 * r00 + 150 * g00 + 29 * b00) >> 8) as u8;
-                    *y_dst0.add(c1) = ((77 * r01 + 150 * g01 + 29 * b01) >> 8) as u8;
-                    *y_dst1.add(c0) = ((77 * r10 + 150 * g10 + 29 * b10) >> 8) as u8;
-                    *y_dst1.add(c1) = ((77 * r11 + 150 * g11 + 29 * b11) >> 8) as u8;
-
-                    let rb = (r00 + r01 + r10 + r11) >> 2;
-                    let gb = (g00 + g01 + g10 + g11) >> 2;
-                    let bb = (b00 + b01 + b10 + b11) >> 2;
-                    *uv_dst.add(col * 2) = (((-43 * rb - 85 * gb + 128 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    *uv_dst.add(col * 2 + 1) = (((128 * rb - 107 * gb - 21 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                }
-            }
-
+        CVPixelBufferLockBaseAddress(pb, 0);
+        let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
+        let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
+        let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        if y_base.is_null() || uv_base.is_null() {
             CVPixelBufferUnlockBaseAddress(pb, 0);
+            CVPixelBufferRelease(pb);
+            anyhow::bail!("NV12 plane is null");
         }
-        Ok(pb)
+        Ok((pb, y_base, y_bpr, uv_base, uv_bpr))
     }
 
-    /// Create NV12 CVPixelBuffer using vImage SIMD acceleration.
-    /// Falls back to scalar create_nv12_from_bgra_fast if vImage unavailable.
+    /// Scalar BGRA→NV12 of the even-sized interior (`sw & !1` × `sh & !1`) straight into the
+    /// locked NV12 planes. Odd edge column/row are handled by `fill_odd_edges`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn nv12_scalar_interior(
+        y_base: *mut u8, y_bpr: usize, uv_base: *mut u8, uv_bpr: usize,
+        data: &[u8], sw: usize, sh: usize, stride: usize,
+    ) {
+        // Single-pass: Y for 2 rows + UV for 1 row per iteration; bounds-free, auto-vectorizable.
+        let src = data.as_ptr();
+        let uv_w = sw / 2;
+        for pr in 0..(sh / 2) {
+            let r0 = pr * 2;
+            let r1 = r0 + 1;
+            let src_r0 = src.add(r0 * stride);
+            let src_r1 = src.add(r1 * stride);
+            let y_dst0 = y_base.add(r0 * y_bpr);
+            let y_dst1 = y_base.add(r1 * y_bpr);
+            let uv_dst = uv_base.add(pr * uv_bpr);
+
+            for col in 0..uv_w {
+                let c0 = col * 2;
+                let c1 = c0 + 1;
+                let p00 = src_r0.add(c0 * 4);
+                let p01 = src_r0.add(c1 * 4);
+                let p10 = src_r1.add(c0 * 4);
+                let p11 = src_r1.add(c1 * 4);
+
+                let (b00, g00, r00) = (*p00 as i32, *p00.add(1) as i32, *p00.add(2) as i32);
+                let (b01, g01, r01) = (*p01 as i32, *p01.add(1) as i32, *p01.add(2) as i32);
+                let (b10, g10, r10) = (*p10 as i32, *p10.add(1) as i32, *p10.add(2) as i32);
+                let (b11, g11, r11) = (*p11 as i32, *p11.add(1) as i32, *p11.add(2) as i32);
+
+                *y_dst0.add(c0) = crate::bt601_y(r00, g00, b00);
+                *y_dst0.add(c1) = crate::bt601_y(r01, g01, b01);
+                *y_dst1.add(c0) = crate::bt601_y(r10, g10, b10);
+                *y_dst1.add(c1) = crate::bt601_y(r11, g11, b11);
+
+                let (u, v) = crate::bt601_uv(
+                    (r00 + r01 + r10 + r11) >> 2,
+                    (g00 + g01 + g10 + g11) >> 2,
+                    (b00 + b01 + b10 + b11) >> 2,
+                );
+                *uv_dst.add(col * 2) = u;
+                *uv_dst.add(col * 2 + 1) = v;
+            }
+        }
+    }
+
+    /// Fill the last pixel column (odd `sw`) and/or last pixel row (odd `sh`) of an NV12 buffer
+    /// whose even interior is already converted. Chroma cells on that edge are computed from
+    /// the real pixels with clamped 2×2 coordinates (edge replication).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fill_odd_edges(
+        y_base: *mut u8, y_bpr: usize, uv_base: *mut u8, uv_bpr: usize,
+        data: &[u8], sw: usize, sh: usize, stride: usize,
+    ) {
+        let odd_w = sw % 2 == 1;
+        let odd_h = sh % 2 == 1;
+        if !odd_w && !odd_h { return; }
+        let px = |r: usize, c: usize| -> (i32, i32, i32) {
+            let p = r * stride + c * 4;
+            (data[p + 2] as i32, data[p + 1] as i32, data[p] as i32)
+        };
+        let write_uv = |ur: usize, uc: usize| {
+            let (r0, r1) = (2 * ur, (2 * ur + 1).min(sh - 1));
+            let (c0, c1) = (2 * uc, (2 * uc + 1).min(sw - 1));
+            let (mut r, mut g, mut b) = (0, 0, 0);
+            for (rr, cc) in [(r0, c0), (r0, c1), (r1, c0), (r1, c1)] {
+                let (pr, pg, pb) = px(rr, cc);
+                r += pr; g += pg; b += pb;
+            }
+            let (u, v) = crate::bt601_uv(r >> 2, g >> 2, b >> 2);
+            *uv_base.add(ur * uv_bpr + uc * 2) = u;
+            *uv_base.add(ur * uv_bpr + uc * 2 + 1) = v;
+        };
+        if odd_w {
+            let c = sw - 1;
+            for r in 0..sh {
+                let (pr, pg, pb) = px(r, c);
+                *y_base.add(r * y_bpr + c) = crate::bt601_y(pr, pg, pb);
+            }
+            for ur in 0..sh.div_ceil(2) { write_uv(ur, c / 2); }
+        }
+        if odd_h {
+            let r = sh - 1;
+            for c in 0..sw {
+                let (pr, pg, pb) = px(r, c);
+                *y_base.add(r * y_bpr + c) = crate::bt601_y(pr, pg, pb);
+            }
+            for uc in 0..sw.div_ceil(2) { write_uv(r / 2, uc); }
+        }
+    }
+
+    /// BGRA → NV12 pool buffer. vImage SIMD for the even interior when available (scalar
+    /// otherwise), then odd edge column/row via scalar so any frame size encodes.
+    #[allow(clippy::too_many_arguments)]
     fn create_nv12_vimage(
         &mut self,
         session: VTCompressionSessionRef,
         enc_w: u32, enc_h: u32,
         data: &[u8], src_w: u32, src_h: u32, stride: usize,
     ) -> Result<CVPixelBufferRef> {
-        let vimage = match &self.vimage {
-            Some(v) => v,
-            None => return Self::create_nv12_from_bgra_fast(session, enc_w, enc_h, data, src_w, src_h, stride),
-        };
-
-        let w = src_w.min(enc_w) as usize;
-        let h = src_h.min(enc_h) as usize;
+        let sw = src_w.min(enc_w) as usize;
+        let sh = src_h.min(enc_h) as usize;
+        let (w, h) = (sw & !1, sh & !1); // even interior
         let y_size = w * h;
         let uv_size = w * h / 2;
 
-        if self.nv12_y_buf.len() < y_size { self.nv12_y_buf.resize(y_size, 0); }
-        if self.nv12_uv_buf.len() < uv_size { self.nv12_uv_buf.resize(uv_size, 0); }
-
-        vimage.bgra_to_nv12(
-            data, src_w, src_h, stride,
-            &mut self.nv12_y_buf[..y_size],
-            &mut self.nv12_uv_buf[..uv_size],
-        ).map_err(|e| anyhow::anyhow!("vImage bgra_to_nv12 failed: {e}"))?;
-
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        unsafe {
-            let pool = VTCompressionSessionGetPixelBufferPool(session);
-            if pool.is_null() { anyhow::bail!("VT pixel buffer pool is null"); }
-            let status = CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut pb);
-            if status != 0 || pb.is_null() { anyhow::bail!("Pool alloc failed: {status}"); }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-            let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-
-            if y_base.is_null() || uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 plane is null");
-            }
-
-            for row in 0..h {
-                std::ptr::copy_nonoverlapping(
-                    self.nv12_y_buf[row * w..].as_ptr(),
-                    y_base.add(row * y_bpr),
-                    w,
-                );
-            }
-            let uv_h = h / 2;
-            for row in 0..uv_h {
-                std::ptr::copy_nonoverlapping(
-                    self.nv12_uv_buf[row * w..].as_ptr(),
-                    uv_base.add(row * uv_bpr),
-                    w,
-                );
-            }
-
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-        }
-        Ok(pb)
-    }
-
-    /// Create a BGRA CVPixelBuffer with VT-managed memory and copy frame data into it.
-    fn create_bgra_pixelbuffer(
-        enc_w: u32, enc_h: u32,
-        data: &[u8], src_w: u32, src_h: u32, stride: usize,
-    ) -> Result<CVPixelBufferRef> {
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        unsafe {
-            let status = CVPixelBufferCreate(
-                std::ptr::null(),
-                enc_w as usize, enc_h as usize,
-                K_CV_PIXEL_FORMAT_32BGRA,
-                std::ptr::null(),
-                &mut pb,
-            );
-            if status != 0 || pb.is_null() {
-                anyhow::bail!("CVPixelBufferCreate BGRA failed: {status}");
-            }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-            let base = CVPixelBufferGetBaseAddress(pb) as *mut u8;
-            let bpr = CVPixelBufferGetBytesPerRow(pb);
-            let copy_rows = (src_h as usize).min(enc_h as usize);
-            let copy_cols_bytes = (src_w as usize * 4).min(bpr);
-            for row in 0..copy_rows {
-                let src_start = row * stride;
-                let dst_start = row * bpr;
-                if src_start + copy_cols_bytes <= data.len() {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(src_start),
-                        base.add(dst_start),
-                        copy_cols_bytes,
-                    );
-                }
-            }
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-        }
-        Ok(pb)
-    }
-
-    /// Convert I420 (YUV420) frame to BGRA using BT.601 reverse transform.
-    fn yuv420_to_bgra(frame: &crate::yuv444_split::Yuv420Frame) -> Vec<u8> {
-        let w = frame.width as usize;
-        let h = frame.height as usize;
-        let uv_w = w / 2;
-        let mut bgra = vec![0u8; w * h * 4];
-
-        for row in 0..h {
-            for col in 0..w {
-                let y_idx = row * w + col;
-                let uv_idx = (row / 2) * uv_w + (col / 2);
-
-                let y = frame.y.get(y_idx).copied().unwrap_or(16) as i32;
-                let u = frame.u.get(uv_idx).copied().unwrap_or(128) as i32;
-                let v = frame.v.get(uv_idx).copied().unwrap_or(128) as i32;
-
-                let c = y - 16;
-                let d = u - 128;
-                let e = v - 128;
-                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-
-                let px = (row * w + col) * 4;
-                bgra[px] = b;
-                bgra[px + 1] = g;
-                bgra[px + 2] = r;
-                bgra[px + 3] = 255;
+        // SIMD convert the interior into scratch planes (vImage needs even dims, tight rows)
+        let mut use_vimage = false;
+        if let (Some(vimage), true) = (&self.vimage, w > 0 && h > 0) {
+            if self.nv12_y_buf.len() < y_size { self.nv12_y_buf.resize(y_size, 0); }
+            if self.nv12_uv_buf.len() < uv_size { self.nv12_uv_buf.resize(uv_size, 0); }
+            match vimage.bgra_to_nv12(data, w as u32, h as u32, stride,
+                                      &mut self.nv12_y_buf[..y_size], &mut self.nv12_uv_buf[..uv_size]) {
+                Ok(()) => use_vimage = true,
+                Err(e) => tracing::warn!("vImage bgra_to_nv12 failed ({e}), using scalar path"),
             }
         }
-        bgra
-    }
-
-    /// Convert BGRA frame to NV12 full-range via session pool buffer (single pass).
-    /// BT.601 full range: Y=0-255, UV=0-255.
-    #[allow(dead_code)]
-    fn create_nv12_from_bgra(
-        session: VTCompressionSessionRef,
-        enc_w: u32, enc_h: u32,
-        data: &[u8], src_w: u32, src_h: u32, stride: usize,
-    ) -> Result<CVPixelBufferRef> {
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        let w = enc_w as usize;
-        let h = enc_h as usize;
-        let sw = src_w as usize;
-        let sh = src_h as usize;
 
         unsafe {
-            let pool = VTCompressionSessionGetPixelBufferPool(session);
-            if pool.is_null() {
-                anyhow::bail!("VT pixel buffer pool is null");
-            }
-            let status = CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut pb);
-            if status != 0 || pb.is_null() {
-                anyhow::bail!("CVPixelBufferPoolCreatePixelBuffer failed: {status}");
-            }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-
-            let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-
-            if y_base.is_null() || uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 plane address is null");
-            }
-
-            let rows = sh.min(h);
-            let cols = sw.min(w);
-
-            // Y plane: full resolution, BT.601 full range
-            for row in 0..rows {
-                let bgra_row = row * stride;
-                let y_row = row * y_bpr;
-                for col in 0..cols {
-                    let px = bgra_row + col * 4;
-                    let b = data[px] as i32;
-                    let g = data[px + 1] as i32;
-                    let r = data[px + 2] as i32;
-                    *y_base.add(y_row + col) = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
+            let (pb, y_base, y_bpr, uv_base, uv_bpr) = Self::lock_pool_nv12(session)?;
+            if use_vimage {
+                for row in 0..h {
+                    std::ptr::copy_nonoverlapping(self.nv12_y_buf[row * w..].as_ptr(), y_base.add(row * y_bpr), w);
                 }
-            }
-
-            // UV plane: half resolution, 2x2 averaged, BT.601 full range
-            let uv_rows = rows / 2;
-            let uv_cols = cols / 2;
-            for row in 0..uv_rows {
-                let r0 = row * 2;
-                let r1 = r0 + 1;
-                let uv_row_off = row * uv_bpr;
-                for col in 0..uv_cols {
-                    let c0 = col * 2;
-                    let c1 = c0 + 1;
-                    // 2x2 block averaging
-                    let mut rb = 0i32; let mut gb = 0i32; let mut bb = 0i32;
-                    for &sr in &[r0, r1] {
-                        for &sc in &[c0, c1] {
-                            let px = sr * stride + sc * 4;
-                            bb += data[px] as i32;
-                            gb += data[px + 1] as i32;
-                            rb += data[px + 2] as i32;
-                        }
-                    }
-                    rb >>= 2; gb >>= 2; bb >>= 2; // /4
-                    let u = (((-43 * rb - 85 * gb + 128 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    let v = (((128 * rb - 107 * gb - 21 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    let off = uv_row_off + col * 2;
-                    *uv_base.add(off) = u;
-                    *uv_base.add(off + 1) = v;
+                for row in 0..h / 2 {
+                    std::ptr::copy_nonoverlapping(self.nv12_uv_buf[row * w..].as_ptr(), uv_base.add(row * uv_bpr), w);
                 }
+            } else {
+                Self::nv12_scalar_interior(y_base, y_bpr, uv_base, uv_bpr, data, sw, sh, stride);
             }
-
+            Self::fill_odd_edges(y_base, y_bpr, uv_base, uv_bpr, data, sw, sh, stride);
             CVPixelBufferUnlockBaseAddress(pb, 0);
+            Ok(pb)
         }
-        Ok(pb)
     }
 
     /// Allocate NV12 pixel buffer from VT session's pool (IOSurface-backed, hardware compatible)
@@ -912,81 +768,6 @@ impl VtEncoder {
                     if src_idx < u_plane.len() && src_idx < v_plane.len() {
                         *uv_base.add(dst_off) = u_plane[src_idx];
                         *uv_base.add(dst_off + 1) = v_plane[src_idx];
-                    }
-                }
-            }
-
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-        }
-
-        Ok(pb)
-    }
-
-    /// Create an IOSurface-backed NV12 CVPixelBuffer from I420 planes.
-    /// Uses CVPixelBufferCreate + memcpy into planes (IOSurface-backed = VT hardware compatible).
-    #[allow(dead_code)]
-    fn create_nv12_pixelbuffer(
-        width: u32, height: u32,
-        y_plane: &[u8], u_plane: &[u8], v_plane: &[u8],
-    ) -> Result<CVPixelBufferRef> {
-        let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-        let w = width as usize;
-        let h = height as usize;
-
-        unsafe {
-            // Create NV12 pixel buffer without IOSurface properties.
-            // VT will handle the memory backing internally.
-            let status = CVPixelBufferCreate(
-                std::ptr::null(),
-                w, h,
-                K_CV_PIXEL_FORMAT_420F,
-                std::ptr::null(), // no attributes — avoids CVPixelBufferCreate+IOSurface+NV12 crash
-                &mut pb,
-            );
-
-            if status != 0 || pb.is_null() {
-                anyhow::bail!("CVPixelBufferCreate NV12 failed: status={status}");
-            }
-
-            CVPixelBufferLockBaseAddress(pb, 0);
-
-            // Plane 0: Y (full resolution)
-            let y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-            if y_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 Y plane is null");
-            }
-            for row in 0..h {
-                let src_start = row * w;
-                let dst_start = row * y_bpr;
-                if src_start + w <= y_plane.len() {
-                    std::ptr::copy_nonoverlapping(
-                        y_plane.as_ptr().add(src_start),
-                        y_base.add(dst_start),
-                        w.min(y_bpr),
-                    );
-                }
-            }
-
-            // Plane 1: interleaved UV (NV12 CbCr)
-            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-            if uv_base.is_null() {
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                CVPixelBufferRelease(pb);
-                anyhow::bail!("NV12 UV plane is null");
-            }
-            let uv_w = w / 2;
-            let uv_h = h / 2;
-            for row in 0..uv_h {
-                for col in 0..uv_w {
-                    let src_idx = row * uv_w + col;
-                    let dst_offset = row * uv_bpr + col * 2;
-                    if src_idx < u_plane.len() && src_idx < v_plane.len() {
-                        *uv_base.add(dst_offset) = u_plane[src_idx];
-                        *uv_base.add(dst_offset + 1) = v_plane[src_idx];
                     }
                 }
             }
@@ -1240,12 +1021,13 @@ impl VideoEncoder for VtEncoder {
                 output_bytes = nal_data.len(),
                 is_keyframe,
                 nal_units = nal_types.join(", "),
+                session_profile = self.profile,
                 profile = profile_info,
                 "VideoToolbox NAL diagnostic"
             );
         }
 
-        if self.frame_count % 300 == 0 {
+        if self.frame_count.is_multiple_of(300) {
             tracing::debug!(
                 frame = self.frame_count,
                 output_bytes = nal_data.len(),
@@ -1313,9 +1095,10 @@ impl VideoEncoder for VtEncoder {
         let w = self.width;
         let h = self.height;
 
-        // Step 1: BGRA → YUV444 → B-area split (only needed for aux view)
-        crate::yuv444_split::bgra_to_yuv444(
-            data, width, height, stride,
+        // Step 1: BGRA → YUV444 written with the encoder (align16) row stride so the split
+        // below — which reads with that stride — sees rows where it expects them.
+        crate::yuv444_split::bgra_to_yuv444_strided(
+            data, width, height, stride, w as usize,
             &mut bufs.y444, &mut bufs.u444, &mut bufs.v444,
         );
         // Main view = standard YUV420, aux view = chroma compensation
@@ -1462,9 +1245,59 @@ impl Drop for VtEncoder {
     fn drop(&mut self) {
         unsafe {
             VTCompressionSessionInvalidate(self.session);
-            if let Some(aux) = self.session_aux {
-                VTCompressionSessionInvalidate(aux);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// profile_idc of the first SPS in an Annex B stream (66 Baseline / 77 Main / 100 High)
+    fn sps_profile_idc(annex_b: &[u8]) -> Option<u8> {
+        annex_b.windows(5)
+            .position(|w| w[..4] == [0, 0, 0, 1] && w[4] & 0x1F == 7)
+            .map(|i| annex_b[i + 5])
+    }
+
+    fn gradient_bgra(w: usize, h: usize) -> Vec<u8> {
+        let mut bgra = vec![0u8; w * h * 4];
+        for row in 0..h {
+            for col in 0..w {
+                let p = (row * w + col) * 4;
+                bgra[p] = (col % 256) as u8;
+                bgra[p + 1] = (row % 256) as u8;
+                bgra[p + 2] = ((col ^ row) % 256) as u8;
+                bgra[p + 3] = 255;
             }
         }
+        bgra
+    }
+
+    /// O3/B2 on real hardware: the session must come up (High profile preferred), produce
+    /// non-empty frames under low-latency RC, and accept odd-sized BGRA input.
+    #[test]
+    fn vt_session_profile_and_odd_size_encode() {
+        let (ew, eh) = (1280u32, 720u32);
+        let mut enc = VtEncoder::new(ew, eh, 30.0, 8_000_000, false).expect("VT session");
+        let bgra = gradient_bgra(ew as usize, eh as usize);
+        let stride = ew as usize * 4;
+
+        let first = enc.encode_bgra(&bgra, ew, eh, stride).unwrap();
+        assert!(first.is_keyframe && !first.data.is_empty(), "first frame must be a non-empty IDR");
+        let idc = sps_profile_idc(&first.data).expect("SPS present on IDR");
+        println!("VT accepted profile: {} (SPS profile_idc={idc})", enc.profile);
+        let expected_idc = match enc.profile { "High" => 100, "Main" => 77, _ => 66 };
+        assert_eq!(idc, expected_idc, "SPS profile_idc must match the accepted profile");
+
+        let mut empty = 0;
+        for _ in 0..30 {
+            if enc.encode_bgra(&bgra, ew, eh, stride).unwrap().data.is_empty() { empty += 1; }
+        }
+        assert_eq!(empty, 0, "{empty}/30 frames came back empty (null sample buffer)");
+
+        // B2: odd width/height must not error and must yield data
+        let odd = enc.encode_bgra(&bgra, ew - 1, eh - 1, stride).unwrap();
+        assert!(!odd.data.is_empty());
     }
 }

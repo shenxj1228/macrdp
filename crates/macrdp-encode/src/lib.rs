@@ -6,7 +6,6 @@ pub mod yuv444_split;
 pub mod color_convert;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
-#[cfg(target_os = "macos")]
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -86,16 +85,50 @@ pub fn align16(v: u32) -> u32 {
     (v + 15) & !15
 }
 
-/// Calculate optimal bitrate for screen content
+/// Target bitrate for screen content, derived from bits per pixel per frame:
+/// LowLatency 0.10 | Balanced 0.20 | HighQuality 0.35, clamped to [2, 80] Mbps.
+///
+/// 1920×1080@60 → 12.4 / 24.9 / 43.5 Mbps;  2880×1800@60 → 31.1 / 62.2 / 80 (cap, raw 108.9) Mbps.
 pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
-    let pixels = width as f64 * height as f64;
-    let base_bpp = match quality {
-        Quality::LowLatency => 8.0,
-        Quality::Balanced => 16.0,
-        Quality::HighQuality => 24.0,
+    let bits_per_pixel = match quality {
+        Quality::LowLatency => 0.10,
+        Quality::Balanced => 0.20,
+        Quality::HighQuality => 0.35,
     };
-    let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
+    let bps = width as f64 * height as f64 * fps.max(1.0) as f64 * bits_per_pixel;
+    bps.clamp(2_000_000.0, 80_000_000.0) as u32
+}
+
+/// Y'CbCr range used by every BGRA→YUV conversion in this crate (vImage, scalar fallbacks,
+/// VideoToolbox session). All sites key off this one constant so they can never drift apart.
+///
+/// `true`  = BT.601 limited/video range (Y 16–235, CbCr 16–240), NV12 '420v', VUI full_range=0.
+/// `false` = BT.601 full range (Y/CbCr 0–255), NV12 '420f', VUI full_range=1.
+///
+/// Full range: limited range was measured to render washed-out/grey on real clients, and
+/// FreeRDP converts AVC420 output as full range regardless of VUI.
+pub const LIMITED_RANGE: bool = false;
+
+/// BT.601 luma for one pixel (scalar reference used by all non-vImage paths).
+#[inline(always)]
+pub fn bt601_y(r: i32, g: i32, b: i32) -> u8 {
+    if LIMITED_RANGE {
+        // 16 ..= 235, provably in range for 8-bit input
+        (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8
+    } else {
+        ((77 * r + 150 * g + 29 * b + 128) >> 8) as u8
+    }
+}
+
+/// BT.601 chroma (Cb, Cr) for one (possibly 2×2-averaged) RGB sample.
+#[inline(always)]
+pub fn bt601_uv(r: i32, g: i32, b: i32) -> (u8, u8) {
+    let (u, v) = if LIMITED_RANGE {
+        (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128, ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128)
+    } else {
+        (((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128, ((128 * r - 107 * g - 21 * b + 128) >> 8) + 128)
+    };
+    (u.clamp(0, 255) as u8, v.clamp(0, 255) as u8)
 }
 
 /// Encoder preference
@@ -124,6 +157,8 @@ impl EncoderPreference {
 pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, preference: EncoderPreference, mode_444: bool, bitrate: u32) -> Result<Box<dyn VideoEncoder>> {
     let enc_w = align16(width);
     let enc_h = align16(height);
+    tracing::info!(width, height, enc_w, enc_h, fps, ?quality, ?preference, mode_444,
+        bitrate_mbps = bitrate as f64 / 1_000_000.0, "Creating H.264 encoder");
 
     // Hardware: VideoToolbox GPU encoder
     #[cfg(target_os = "macos")]
@@ -143,4 +178,32 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
     tracing::info!(enc_w, enc_h, mode_444, "Using OpenH264 software encoder (CPU)");
     let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444)?;
     Ok(Box::new(encoder))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_bitrate_presets_and_clamps() {
+        assert_eq!(screen_bitrate(1920, 1080, 60.0, Quality::LowLatency), 12_441_600);
+        assert_eq!(screen_bitrate(1920, 1080, 60.0, Quality::Balanced), 24_883_200);
+        assert_eq!(screen_bitrate(1920, 1080, 60.0, Quality::HighQuality), 43_545_600);
+        assert_eq!(screen_bitrate(2880, 1800, 60.0, Quality::LowLatency), 31_104_000);
+        assert_eq!(screen_bitrate(2880, 1800, 60.0, Quality::Balanced), 62_208_000);
+        // 108.9 Mbps raw → capped
+        assert_eq!(screen_bitrate(2880, 1800, 60.0, Quality::HighQuality), 80_000_000);
+        // tiny screens never starve the encoder
+        assert_eq!(screen_bitrate(640, 480, 30.0, Quality::LowLatency), 2_000_000);
+    }
+
+    #[test]
+    fn bt601_scalar_black_white_gray() {
+        let (lo, hi) = if LIMITED_RANGE { (16, 235) } else { (0, 255) };
+        assert_eq!(bt601_y(0, 0, 0), lo);
+        assert_eq!(bt601_y(255, 255, 255), hi);
+        assert_eq!(bt601_uv(128, 128, 128), (128, 128));
+        let (u, v) = bt601_uv(0, 0, 255); // pure blue → Cb high
+        assert!(u > 200 && v < 128, "blue: u={u} v={v}");
+    }
 }

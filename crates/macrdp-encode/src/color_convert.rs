@@ -6,6 +6,8 @@
 
 use std::ffi::c_void;
 
+use crate::LIMITED_RANGE;
+
 // ---------------------------------------------------------------------------
 // FFI types — matching Apple's vImage_Types.h definitions exactly
 // ---------------------------------------------------------------------------
@@ -118,18 +120,31 @@ pub struct VImageConverter {
 }
 
 impl VImageConverter {
-    /// Create a new converter using BT.601 full-range (0-255 for Y/Cb/Cr).
+    /// Create a new converter using BT.601 in the crate-wide range (see [`LIMITED_RANGE`]).
     pub fn new() -> Result<Self, String> {
-        // Full-range: Yp_bias=0, CbCr_bias=128, all max=255, all min=0
-        let pixel_range = VImageYpCbCrPixelRange {
-            yp_bias: 0,
-            cb_cr_bias: 128,
-            yp_range_max: 255,
-            cb_cr_range_max: 255,
-            yp_max: 255,
-            yp_min: 0,
-            cb_cr_max: 255,
-            cb_cr_min: 0,
+        let pixel_range = if LIMITED_RANGE {
+            // Video range: Y 16-235, CbCr 16-240 (Apple's documented "video range" tuple)
+            VImageYpCbCrPixelRange {
+                yp_bias: 16,
+                cb_cr_bias: 128,
+                yp_range_max: 235,
+                cb_cr_range_max: 240,
+                yp_max: 235,
+                yp_min: 16,
+                cb_cr_max: 240,
+                cb_cr_min: 16,
+            }
+        } else {
+            VImageYpCbCrPixelRange {
+                yp_bias: 0,
+                cb_cr_bias: 128,
+                yp_range_max: 255,
+                cb_cr_range_max: 255,
+                yp_max: 255,
+                yp_min: 0,
+                cb_cr_max: 255,
+                cb_cr_min: 0,
+            }
         };
 
         let mut i420_info = VImageARGBToYpCbCr {
@@ -199,7 +214,7 @@ impl VImageConverter {
         let uv_size = uv_w * uv_h;
         let required = y_size + uv_size * 2;
 
-        if w % 2 != 0 || h % 2 != 0 {
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(format!("width ({w}) and height ({h}) must both be even"));
         }
         if bgra.len() < (h - 1) * stride + w * 4 {
@@ -290,7 +305,7 @@ impl VImageConverter {
         let y_size = w * h;
         let uv_size = w * (h / 2); // interleaved CbCr: (w/2) samples * 2 bytes = w bytes per row, h/2 rows
 
-        if w % 2 != 0 || h % 2 != 0 {
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(format!("width ({w}) and height ({h}) must both be even"));
         }
         if bgra.len() < (h - 1) * stride + w * 4 {
@@ -443,12 +458,12 @@ mod tests {
             .bgra_to_nv12(&bgra, w, h, stride, &mut y_out, &mut uv_out)
             .expect("bgra_to_nv12 failed");
 
-        // For uniform gray (128,128,128), BT.601 full-range Y should be ~128
-        // Allow some tolerance for rounding differences
+        // Uniform gray must match the scalar reference (same range) within rounding
+        let exp_y = crate::bt601_y(128, 128, 128) as i32;
         for (i, &y) in y_out.iter().enumerate() {
             assert!(
-                (y as i32 - 128).unsigned_abs() <= 2,
-                "Y[{i}] = {y}, expected ~128 for uniform gray"
+                (y as i32 - exp_y).unsigned_abs() <= 2,
+                "Y[{i}] = {y}, expected ~{exp_y} for uniform gray"
             );
         }
 
@@ -488,5 +503,46 @@ mod tests {
             err_msg.contains("too small"),
             "Error should mention 'too small', got: {err_msg}"
         );
+    }
+
+    /// B3: vImage and the scalar fallback must produce the same range/matrix.
+    #[test]
+    fn test_vimage_matches_scalar_reference() {
+        let converter = VImageConverter::new().expect("VImageConverter::new failed");
+        let (w, h): (u32, u32) = (32, 32);
+        let stride = w as usize * 4;
+        let mut bgra = vec![0u8; stride * h as usize];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let px = row * stride + col * 4;
+                bgra[px] = (col * 8) as u8;
+                bgra[px + 1] = (row * 8) as u8;
+                bgra[px + 2] = ((row * col) % 256) as u8;
+                bgra[px + 3] = 255;
+            }
+        }
+        let y_size = (w * h) as usize;
+        let mut yuv = vec![0u8; y_size * 3 / 2];
+        converter.bgra_to_i420(&bgra, w, h, stride, &mut yuv).unwrap();
+
+        let mut max_dy = 0i32;
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let px = row * stride + col * 4;
+                let (b, g, r) = (bgra[px] as i32, bgra[px + 1] as i32, bgra[px + 2] as i32);
+                let dy = (yuv[row * w as usize + col] as i32 - crate::bt601_y(r, g, b) as i32).abs();
+                max_dy = max_dy.max(dy);
+            }
+        }
+        // Black and white must hit the exact range endpoints in both paths
+        let black = crate::bt601_y(0, 0, 0);
+        let white = crate::bt601_y(255, 255, 255);
+        let mut bw = vec![0u8; 16 * 2 * 4];
+        for px in bw.chunks_mut(4).skip(16) { px.copy_from_slice(&[255, 255, 255, 255]); }
+        let mut bw_yuv = vec![0u8; 16 * 2 * 3 / 2];
+        converter.bgra_to_i420(&bw, 16, 2, 64, &mut bw_yuv).unwrap();
+        assert!((bw_yuv[0] as i32 - black as i32).abs() <= 1, "black: vImage={} scalar={black}", bw_yuv[0]);
+        assert!((bw_yuv[16] as i32 - white as i32).abs() <= 1, "white: vImage={} scalar={white}", bw_yuv[16]);
+        assert!(max_dy <= 2, "vImage vs scalar luma differ by up to {max_dy}");
     }
 }
