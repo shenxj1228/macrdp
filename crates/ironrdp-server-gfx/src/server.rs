@@ -576,7 +576,7 @@ impl RdpServer {
                     ).context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
-                        svc_messages.into(),
+                        svc_messages,
                         drdynvc_id,
                         user_channel_id,
                     )?;
@@ -609,7 +609,7 @@ impl RdpServer {
                     ).context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
-                        svc_messages.into(),
+                        svc_messages,
                         drdynvc_id,
                         user_channel_id,
                     )?;
@@ -749,7 +749,7 @@ impl RdpServer {
                     let pdu = ClipboardPdu::FileContentsRequest(request);
                     let svc_msg = encode_cliprdr_pdu(pdu);
                     let data = server_encode_svc_messages(
-                        vec![svc_msg].into(),
+                        vec![svc_msg],
                         channel_id,
                         user_channel_id,
                     )?;

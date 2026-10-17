@@ -28,6 +28,8 @@ impl BitmapEncoder {
         //
         // It’s not clear how to achieve that yet, but generally, server uses multiple of 4-widths,
         // and client has surface capabilities, so this path is unlikely.
+        // `is_multiple_of` needs Rust 1.87; workspace MSRV is 1.75
+        #[allow(clippy::manual_is_multiple_of)]
         if bitmap.width.get() % 4 != 0 {
             return Err(BitmapEncodeError::Encode(invalid_field_err!(
                 "bitmap",

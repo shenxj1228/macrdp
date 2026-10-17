@@ -9,7 +9,7 @@ use ironrdp_pdu::rdp::vc::dvc::gfx::{
     Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
     CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV81Flags,
     CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, EndFramePdu, Encoding,
-    MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu,
+    MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, QueueDepth, ResetGraphicsPdu,
     ServerPdu, StartFramePdu, Timestamp,
 };
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
@@ -229,8 +229,11 @@ pub struct GfxState {
     pub confirmed_cap: Option<CapabilitySet>,
     pub width: u16,
     pub height: u16,
-    /// Frames sent but not yet acknowledged
+    /// Frames sent but not yet acknowledged. Always 0 while `acks_suspended`.
     pub pending_acks: u32,
+    /// Client sent `queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT` (0xFFFFFFFF): it will not
+    /// acknowledge frames until it sends a regular ack again (MS-RDPEGFX 2.2.3.3).
+    pub acks_suspended: bool,
     /// Last acknowledged frame ID
     pub last_ack_frame: u32,
     /// Network quality estimate (0.0 = congested, 1.0 = excellent)
@@ -281,6 +284,7 @@ impl GfxState {
             width,
             height,
             pending_acks: 0,
+            acks_suspended: false,
             last_ack_frame: 0,
             network_quality: 1.0,
             frame_send_times: [None; SEND_TIME_SLOTS],
@@ -304,7 +308,9 @@ impl GfxState {
 
     pub fn next_frame_id(&mut self) -> u32 {
         self.frame_id += 1;
-        self.pending_acks += 1;
+        if !self.acks_suspended {
+            self.pending_acks += 1;
+        }
         self.total_bytes_sent += self.last_frame_bytes as u64;
         if self.start_time.is_none() {
             self.start_time = Some(std::time::Instant::now());
@@ -323,8 +329,16 @@ impl GfxState {
         self.frame_id
     }
 
+    /// Client stopped acknowledging frames: nothing is outstanding from its point of view, so
+    /// the backlog must not keep growing (display skips frames on `pending_acks`).
+    pub fn suspend_acks(&mut self) {
+        self.acks_suspended = true;
+        self.pending_acks = 0;
+    }
+
     /// Update network quality and RTT based on frame acknowledgment
     pub fn ack_frame(&mut self, ack_frame_id: u32) {
+        self.acks_suspended = false;
         self.last_ack_frame = ack_frame_id;
         if self.pending_acks > 0 {
             self.pending_acks -= 1;
@@ -781,6 +795,11 @@ impl DvcProcessor for GfxHandler {
 
             ClientPdu::FrameAcknowledge(ack) => {
                 let mut state = self.state.lock().unwrap();
+                if ack.queue_depth == QueueDepth::Suspend {
+                    debug!(frame_id = ack.frame_id, "GFX: client suspended frame acknowledgements");
+                    state.suspend_acks();
+                    return Ok(Vec::new());
+                }
                 state.ack_frame(ack.frame_id);
 
                 // Log stats every 60 acked frames (~1 second at 60fps)
@@ -1065,5 +1084,41 @@ mod tests {
         let before = s.rtt_ewma_ms;
         s.ack_frame(44);
         assert_eq!(s.rtt_ewma_ms, before);
+    }
+
+    #[test]
+    fn suspend_ack_clears_backlog_and_stops_counting_until_resume() {
+        let mut s = GfxState::new(1, 1, false);
+        for _ in 0..5 {
+            s.next_frame_id();
+        }
+        assert_eq!(s.pending_acks, 5);
+        s.suspend_acks();
+        assert!(s.acks_suspended);
+        assert_eq!(s.pending_acks, 0);
+        for _ in 0..100 {
+            s.next_frame_id();
+        }
+        assert_eq!(s.pending_acks, 0);
+        // A regular ack resumes counting.
+        s.ack_frame(105);
+        assert!(!s.acks_suspended);
+        s.next_frame_id();
+        assert_eq!(s.pending_acks, 1);
+    }
+
+    #[test]
+    fn suspend_pdu_through_handler() {
+        let (mut h, state) = handler();
+        state.lock().unwrap().next_frame_id();
+        // RDPGFX_FRAME_ACKNOWLEDGE_PDU: cmdId 0x0D, flags, pduLength 20, queueDepth, frameId, totalFramesDecoded
+        let mut pdu = vec![0x0D, 0x00, 0x00, 0x00, 20, 0, 0, 0];
+        pdu.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        pdu.extend_from_slice(&1u32.to_le_bytes());
+        pdu.extend_from_slice(&1u32.to_le_bytes());
+        h.process(7, &pdu).unwrap();
+        let s = state.lock().unwrap();
+        assert!(s.acks_suspended);
+        assert_eq!(s.pending_acks, 0);
     }
 }
