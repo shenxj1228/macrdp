@@ -249,7 +249,7 @@ impl EncoderParams {
 
 /// Cached frame data for idle IDR re-encoding.
 enum CachedFrame {
-    Bgra { data: Vec<u8>, width: u32, height: u32, stride: usize },
+    Bgra { data: Bytes, width: u32, height: u32, stride: usize },
     PixelBuffer(SafePixelBuffer, u32, u32), // buffer, width, height
 }
 
@@ -512,18 +512,30 @@ impl MacDisplayUpdates {
             return Ok(None);
         }
         let Some(cache) = self.last_frame_cache.as_ref() else { return Ok(None) };
-        let Some(encoder) = self.encoder.as_mut() else { return Ok(None) };
+        if self.encoder.is_none() {
+            return Ok(None);
+        }
+        let (vis_w, vis_h) = self.cached_frame_size();
+        // Owned copy for the blocking pool: Bytes is refcounted, PixelBuffer gets its own retain.
+        let input = match cache {
+            CachedFrame::Bgra { data, width, height, stride } => {
+                CachedFrame::Bgra { data: data.clone(), width: *width, height: *height, stride: *stride }
+            }
+            CachedFrame::PixelBuffer(buf, w, h) => CachedFrame::PixelBuffer(buf.clone_ref(), *w, *h),
+        };
 
         let t0 = Instant::now();
-        let result = match cache {
-            CachedFrame::Bgra { data, width, height, stride } => {
-                encoder.force_keyframe();
-                encoder.encode_bgra(data, *width, *height, *stride)
-            }
-            CachedFrame::PixelBuffer(buf, _w, _h) => {
-                encoder.encode_pixel_buffer(buf.as_ptr(), true)
-            }
-        };
+        let result = self
+            .with_encoder_blocking(move |enc| {
+                enc.force_keyframe();
+                match &input {
+                    CachedFrame::Bgra { data, width, height, stride } => {
+                        enc.encode_bgra(data, *width, *height, *stride)
+                    }
+                    CachedFrame::PixelBuffer(buf, ..) => enc.encode_pixel_buffer(buf.as_ptr(), true),
+                }
+            })
+            .await;
 
         match result {
             Ok(encoded) if !encoded.data.is_empty() => {
@@ -535,10 +547,6 @@ impl MacDisplayUpdates {
                     "Sent idle IDR keepalive"
                 );
                 self.last_idr_time = Instant::now();
-                let (vis_w, vis_h) = match cache {
-                    CachedFrame::Bgra { width, height, .. } => (*width as u16, *height as u16),
-                    CachedFrame::PixelBuffer(_, w, h) => (*w as u16, *h as u16),
-                };
                 Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                     h264_data: encoded.data,
                     width: vis_w,
@@ -703,7 +711,7 @@ impl MacDisplayUpdates {
         if total_area == 0 || (!full && total_area > UNCOMPRESSED_MAX_PIXELS) {
             return None;
         }
-        let bgra = frame.data.as_bgra_bytes()?;
+        let FrameData::Raw(bgra) = &frame.data else { return None };
 
         let rects: Vec<UncompressedRect> = dirty_rects.iter()
             .filter(|r| r.width > 0 && r.height > 0)
@@ -749,7 +757,7 @@ impl MacDisplayUpdates {
         // Keep the idle-IDR cache current so a keepalive IDR re-encodes this content,
         // not the frame from before these dirty rects.
         self.last_frame_cache = Some(CachedFrame::Bgra {
-            data: bgra.to_vec(), width: frame.width, height: frame.height, stride: frame.stride,
+            data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
         });
         tracing::debug!(
             display_frame = self.display_frame_count,
@@ -858,7 +866,7 @@ impl MacDisplayUpdates {
                     FrameData::Raw(bgra) => {
                         encoder.submit_bgra(bgra, frame.width, frame.height, frame.stride)?;
                         CachedFrame::Bgra {
-                            data: bgra.to_vec(), width: frame.width, height: frame.height, stride: frame.stride,
+                            data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
                         }
                     }
                 });
@@ -870,90 +878,22 @@ impl MacDisplayUpdates {
                 return Ok(prev_update.or(Some(DisplayUpdate::DefaultPointer)));
             }
 
-            // ── Synchronous path (original code, also fallback when !supports_pipeline) ──
-            if let Some(encoder) = &mut self.encoder {
+            // ── Synchronous path (BGRA only, also fallback when !supports_pipeline) ──
+            if self.encoder.is_some() {
                 self.display_frame_count += 1;
                 let t0 = std::time::Instant::now();
 
-                // Route based on frame data type
-                match &frame.data {
-                    FrameData::PixelBuffer(buf) => {
-                        // Zero-copy VT path — synchronous encode
-                        match encoder.encode_pixel_buffer(buf.as_ptr(), false) {
-                            Ok(encoded) if !encoded.data.is_empty() => {
-                                // Cache for idle IDR re-encoding — before any await, since
-                                // `buf` (&SafePixelBuffer) must not live across one.
-                                self.last_frame_cache = Some(CachedFrame::PixelBuffer(
-                                    buf.clone_ref(), frame.width, frame.height,
-                                ));
-                                let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                let is_keyframe = encoded.is_keyframe;
-                                tracing::debug!(
-                                    display_frame = self.display_frame_count,
-                                    h264_bytes = encoded.data.len(),
-                                    is_keyframe,
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    "Display: sending zero-copy GFX frame"
-                                );
-                                {
-                                    let mut st = self.gfx_state.lock().unwrap();
-                                    st.last_encode_ms = encode_ms;
-                                    st.last_frame_bytes = encoded.data.len() as u32;
-                                }
-                                self.bitrate_ctrl.record_frame(FrameStats {
-                                    encode_ms,
-                                    frame_bytes: encoded.data.len() as u32,
-                                    is_keyframe,
-                                });
-                                if let Some(ps) = &self.perf_stats {
-                                    ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
-                                }
-                                self.apply_adaptive_decision().await;
-                                let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                                if encode_ms > frame_interval_ms * 0.95 {
-                                    self.skip_next_frame = true;
-                                    self.overload_count += 1;
-                                    if self.overload_count % 60 == 1 {
-                                        tracing::warn!(
-                                            encode_ms = format!("{:.1}", encode_ms),
-                                            frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                            overload_total = self.overload_count,
-                                            "encode overload — skipping frames"
-                                        );
-                                    }
-                                }
-                                if is_keyframe {
-                                    self.last_idr_time = Instant::now();
-                                }
-                                return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                    h264_data: encoded.data,
-                                    width: frame.width as u16,
-                                    height: frame.height as u16,
-                                    enc_width: encoded.width as u16,
-                                    enc_height: encoded.height as u16,
-                                    is_keyframe,
-                                    h264_aux: None,
-                                })));
-                            }
-                            Ok(_) => {
-                                macrdp_encode::warn_limited!("Zero-copy encode returned empty data");
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
-                            }
-                            Err(e) => {
-                                macrdp_encode::warn_limited!("Zero-copy encode failed: {e}, falling back to DefaultPointer");
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
-                            }
-                        }
-                    }
-                    FrameData::Raw(_) => {
-                        // Existing BGRA encode path — continues below
-                    }
-                }
-                let bgra = frame.data.as_bgra_bytes().unwrap();
+                // PixelBuffer frames are only produced for supports_pixel_buffer() encoders (VT),
+                // which always pipeline, so they never reach this path.
+                let FrameData::Raw(bgra) = &frame.data else {
+                    macrdp_encode::warn_limited!("PixelBuffer frame on synchronous encode path — dropping frame");
+                    return Ok(Some(DisplayUpdate::DefaultPointer));
+                };
 
-                // AVC444 dual-stream path
-                if use_444 && encoder.supports_444() {
-                    match encoder.encode_bgra_444(bgra, frame.width, frame.height, frame.stride) {
+                // AVC444 dual-stream path (CPU colour conversion + encode → blocking pool)
+                if use_444 && self.encoder.as_ref().is_some_and(|e| e.supports_444()) {
+                    let (data, w, h, stride) = (bgra.clone(), frame.width, frame.height, frame.stride);
+                    match self.with_encoder_blocking(move |enc| enc.encode_bgra_444(&data, w, h, stride)).await {
                         Ok(encoded) if !encoded.main_view.data.is_empty() => {
                             let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             let total_bytes = encoded.main_view.data.len() + encoded.aux_view.data.len();
@@ -995,7 +935,7 @@ impl MacDisplayUpdates {
                             }
                             // Cache frame for idle IDR re-encoding
                             self.last_frame_cache = Some(CachedFrame::Bgra {
-                                data: bgra.to_vec(), width: frame.width, height: frame.height, stride: frame.stride,
+                                data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
                             });
                             if is_keyframe {
                                 self.last_idr_time = Instant::now();
@@ -1028,8 +968,7 @@ impl MacDisplayUpdates {
                 // OpenH264 is a synchronous CPU encode (~tens of ms); run it on the blocking
                 // pool so the single-threaded server runtime keeps handling input/ACKs meanwhile.
                 let encoded = {
-                    let FrameData::Raw(raw) = &frame.data else { unreachable!("Raw checked above") };
-                    let (data, w, h, stride) = (raw.clone(), frame.width, frame.height, frame.stride);
+                    let (data, w, h, stride) = (bgra.clone(), frame.width, frame.height, frame.stride);
                     self.with_encoder_blocking(move |enc| enc.encode_bgra(&data, w, h, stride)).await
                 };
                 match encoded {
@@ -1072,7 +1011,7 @@ impl MacDisplayUpdates {
                         }
                         // Cache frame for idle IDR re-encoding
                         self.last_frame_cache = Some(CachedFrame::Bgra {
-                            data: bgra.to_vec(), width: frame.width, height: frame.height, stride: frame.stride,
+                            data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
                         });
                         if is_keyframe {
                             self.last_idr_time = Instant::now();
