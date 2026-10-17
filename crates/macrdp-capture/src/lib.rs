@@ -13,14 +13,14 @@ use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().preflight()
+    ScreenCaptureAccess.preflight()
 }
 
 /// Request Screen Recording permission (triggers system dialog if not granted)
 /// Returns true if already granted. Note: even after granting, the app
 /// may need to be restarted for the permission to take effect.
 pub fn request_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().request()
+    ScreenCaptureAccess.request()
 }
 
 /// Open System Settings to Privacy & Security page
@@ -40,12 +40,30 @@ pub struct Rect {
 }
 
 /// Pixel format for screen capture output
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapturePixelFormat {
     /// BGRA 32-bit (default, needed for OpenH264 and bitmap fallback path)
     Bgra,
-    /// NV12 (420f full-range) — zero-copy to VideoToolbox, no color conversion needed
-    Nv12,
+    /// NV12 '420f' full range (Y/CbCr 0–255) — zero-copy to VideoToolbox.
+    Nv12Full,
+    /// NV12 '420v' video/limited range (Y 16–235) — zero-copy to VideoToolbox.
+    Nv12Video,
+}
+
+impl CapturePixelFormat {
+    /// Legacy alias for [`Self::Nv12Full`]; prefer `Self::nv12(macrdp_encode::LIMITED_RANGE)`.
+    #[allow(non_upper_case_globals)]
+    pub const Nv12: Self = Self::Nv12Full;
+
+    /// NV12 variant matching the encoder's Y'CbCr range (`macrdp_encode::LIMITED_RANGE`).
+    pub const fn nv12(limited_range: bool) -> Self {
+        if limited_range { Self::Nv12Video } else { Self::Nv12Full }
+    }
+
+    /// True for either NV12 variant.
+    pub const fn is_nv12(self) -> bool {
+        matches!(self, Self::Nv12Full | Self::Nv12Video)
+    }
 }
 
 /// Frame pixel data — either raw BGRA bytes or a zero-copy CVPixelBuffer reference
@@ -138,7 +156,7 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         }
 
         let event = match self.pixel_format {
-            CapturePixelFormat::Nv12 => extract_frame_nv12(&sample),
+            CapturePixelFormat::Nv12Full | CapturePixelFormat::Nv12Video => extract_frame_nv12(&sample),
             CapturePixelFormat::Bgra => extract_frame(&sample),
         };
         let Some(event) = event else { return };
@@ -385,7 +403,7 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
         .into_iter()
         .next()
         .context("No display found")?;
-    Ok((display.width() as u32, display.height() as u32))
+    Ok((display.width(), display.height()))
 }
 
 /// Query the main display's logical bounds from CoreGraphics.
@@ -413,7 +431,7 @@ impl ScreenCapturer {
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Result<Self> {
         // SCShareableContent::get() is synchronous, run in blocking task
-        let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
+        let content = tokio::task::spawn_blocking(SCShareableContent::get)
             .await?
             .context("Failed to get shareable content (Screen Recording permission needed)")?;
 
@@ -460,7 +478,10 @@ impl ScreenCapturer {
             .with_color_space_name("kCGColorSpaceSRGB")
             .with_minimum_frame_interval(&frame_interval)
             .with_pixel_format(match config.pixel_format {
-                CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
+                // Must match the encoder session's NV12 tag (see `K_CV_PIXEL_FORMAT_NV12` in
+                // macrdp-encode/src/videotoolbox.rs); mismatch = VT rejects the buffer.
+                CapturePixelFormat::Nv12Full => PixelFormat::YCbCr_420f,
+                CapturePixelFormat::Nv12Video => PixelFormat::YCbCr_420v,
                 CapturePixelFormat::Bgra => PixelFormat::BGRA,
             })
             .with_shows_cursor(config.show_cursor)
