@@ -79,6 +79,9 @@ extern "C" {
         total_length_out: *mut usize, data_pointer_out: *mut *mut u8,
     ) -> OSStatus;
     fn CMBlockBufferGetDataLength(buf: *mut c_void) -> usize;
+    fn CMBlockBufferCopyDataBytes(
+        the_source_buffer: *mut c_void, offset_to_data: usize, data_length: usize, destination: *mut c_void,
+    ) -> OSStatus;
     fn CMSampleBufferGetFormatDescription(sbuf: CMSampleBufferRef) -> *const c_void;
     fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
         video_desc: *const c_void, index: usize,
@@ -210,16 +213,20 @@ extern "C" fn encode_callback(
     _info_flags: VTEncodeInfoFlags, sample_buffer: CMSampleBufferRef,
 ) {
     let ctx = unsafe { &*(ref_con as *const CallbackCtx) };
+    // Every exit must signal, otherwise the encoder thread waits out its full timeout.
+    // Signalling without an output leaves the slot `None` → caller sees an empty frame.
+    let signal_empty = || {
+        ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
+        ctx.ready.notify_one();
+    };
 
     if status != 0 || sample_buffer.is_null() {
-        // Signal has_data so encoder doesn't timeout waiting — it will get empty data
         if status != 0 {
             warn_limited!(status, "VT encode callback error");
         } else {
             warn_limited!("VT dropped frame (encoder over budget: QP cap vs data-rate limit, or session overloaded)");
         }
-        ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
-        ctx.ready.notify_one();
+        signal_empty();
         return;
     }
 
@@ -229,17 +236,36 @@ extern "C" fn encode_callback(
     unsafe {
         let format_desc = CMSampleBufferGetFormatDescription(sample_buffer);
         let block_buf = CMSampleBufferGetDataBuffer(sample_buffer);
-        if block_buf.is_null() { return; }
+        if block_buf.is_null() {
+            warn_limited!("VT sample buffer has no data buffer");
+            signal_empty();
+            return;
+        }
 
         let total_len = CMBlockBufferGetDataLength(block_buf);
         // One exact allocation: Annex B output is ≈ AVCC input (+ SPS/PPS on IDR)
         annex_b = Vec::with_capacity(total_len + 128);
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut length: usize = 0;
-        if CMBlockBufferGetDataPointer(block_buf, 0, &mut length, std::ptr::null_mut(), &mut data_ptr) != 0 {
+        let st = CMBlockBufferGetDataPointer(block_buf, 0, &mut length, std::ptr::null_mut(), &mut data_ptr);
+        if st != 0 {
+            warn_limited!(status = st, "CMBlockBufferGetDataPointer failed");
+            signal_empty();
             return;
         }
-        let data = std::slice::from_raw_parts(data_ptr, total_len);
+        // `length` is the contiguous run at offset 0; a multi-segment block buffer reports
+        // less than `total_len`, so gather it into one allocation instead of reading past it.
+        let mut contig = Vec::new();
+        if length < total_len {
+            contig.resize(total_len, 0u8);
+            let st = CMBlockBufferCopyDataBytes(block_buf, 0, total_len, contig.as_mut_ptr() as *mut c_void);
+            if st != 0 {
+                warn_limited!(status = st, "CMBlockBufferCopyDataBytes failed");
+                signal_empty();
+                return;
+            }
+        }
+        let data: &[u8] = if contig.is_empty() { std::slice::from_raw_parts(data_ptr, total_len) } else { &contig };
 
         // First pass: check if any NAL is IDR (type 5) to determine keyframe
         let mut nal_header_len: i32 = 4;
@@ -358,7 +384,13 @@ pub struct VtEncoder {
     profile: &'static str,
     width: u32,
     height: u32,
+    /// Frames submitted (logs/diagnostics only; PTS comes from the wall clock)
     frame_count: u64,
+    /// Wall-clock origin of the PTS timeline (µs timescale), so VT rate control sees the
+    /// real inter-frame gaps (SCK only delivers on change) instead of a synthetic 1/fps grid.
+    t0: std::time::Instant,
+    /// Last PTS handed to VT; keeps the timeline strictly monotonic (+1 µs on collision).
+    last_pts_us: i64,
     fps: f32,
     mode_444: bool,
     yuv444_buf: Option<Yuv444Buffers>,
@@ -384,7 +416,7 @@ impl VtEncoder {
         // NV12 input for both AVC420 and AVC444 (range per `LIMITED_RANGE`).
         // AVC444 uses this single session for both streams, per MS-RDPEGFX
         // ("MUST be encoded using the same encoder").
-        let (session, profile) = Self::create_session(width, height, fps, bitrate, &callback_ctx, K_CV_PIXEL_FORMAT_NV12)?;
+        let (session, profile) = Self::create_session(width, height, fps, Self::session_bitrate(bitrate, mode_444), &callback_ctx, K_CV_PIXEL_FORMAT_NV12)?;
 
         let yuv444_buf = if mode_444 {
             Some(Yuv444Buffers::new(width, height))
@@ -412,6 +444,8 @@ impl VtEncoder {
             width,
             height,
             frame_count: 0,
+            t0: std::time::Instant::now(),
+            last_pts_us: -1,
             fps,
             mode_444,
             yuv444_buf,
@@ -422,8 +456,52 @@ impl VtEncoder {
         })
     }
 
+    /// Rate handed to VT. AVC444 pushes two frames (main + aux) per captured frame through one
+    /// session on a real-time PTS axis, so the session rate is 2× the configured rate to keep
+    /// the per-view budget at the configured value.
+    fn session_bitrate(bitrate: u32, mode_444: bool) -> u32 {
+        if mode_444 { bitrate.saturating_mul(2) } else { bitrate }
+    }
+
+    /// `VTSessionSetProperty` for a freshly created CFNumber: sets it and releases the number.
+    unsafe fn set_num(session: VTCompressionSessionRef, key: CFStringRef, num: CFTypeRef) -> OSStatus {
+        let st = VTSessionSetProperty(session, key, num);
+        CFRelease(num);
+        st
+    }
+
+    /// AverageBitRate `bps` plus DataRateLimits: 1.5× over 1 s (long-term ceiling) and 2× over
+    /// 100 ms (a single keyframe can no longer eat a whole second's budget and queue up on the
+    /// socket). Falls back to the 1 s pair alone if VT rejects the 4-element form.
+    unsafe fn apply_bitrate(session: VTCompressionSessionRef, bps: u32) -> Result<()> {
+        let st = Self::set_num(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bps as i32));
+        if st != 0 {
+            anyhow::bail!("VT rejected AverageBitRate: {st}");
+        }
+        let bytes_per_sec = bps as f64 / 8.0;
+        let limits = [
+            cf_i32((bytes_per_sec * 1.5) as i32), cf_f64(1.0),
+            cf_i32((bytes_per_sec * 2.0 * 0.1) as i32), cf_f64(0.1),
+        ];
+        let arr = CFArrayCreate(std::ptr::null(), limits.as_ptr(), 4, &kCFTypeArrayCallBacks);
+        let mut st = VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
+        CFRelease(arr);
+        if st != 0 {
+            warn_limited!(status = st, "VT rejected 4-element DataRateLimits, using 1 s window only");
+            let arr = CFArrayCreate(std::ptr::null(), limits.as_ptr(), 2, &kCFTypeArrayCallBacks);
+            st = VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
+            CFRelease(arr);
+        }
+        for n in limits { CFRelease(n); }
+        if st != 0 {
+            anyhow::bail!("VT rejected DataRateLimits: {st}");
+        }
+        Ok(())
+    }
+
     /// Create a VT compression session with the given parameters.
     /// `pixel_format` controls the expected input pixel format (BGRA or NV12).
+    /// `bitrate` is the session rate (see `session_bitrate`).
     fn create_session(
         width: u32, height: u32, fps: f32, bitrate: u32,
         callback_ctx: &Arc<CallbackCtx>,
@@ -516,7 +594,7 @@ impl VtEncoder {
             VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxFrameDelayCount, cf_i32(0));
+            Self::set_num(session, kVTCompressionPropertyKey_MaxFrameDelayCount, cf_i32(0));
             // Temporal compression (P-frames) — do NOT set ReferenceBufferCount
             // (on Apple Silicon, setting it to 1 forces all-IDR)
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
@@ -529,27 +607,16 @@ impl VtEncoder {
                 tracing::warn!(status = st, "VT rejected YCbCrMatrix=ITU_R_601_4");
             }
 
-            // Rate control: AverageBitRate target + a soft ceiling of 1.5× average per second.
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64));
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate as i32));
-            {
-                let bytes_per_sec = cf_i32((bitrate as f64 / 8.0 * 1.5) as i32);
-                let one_sec = cf_f64(1.0);
-                let limits = [bytes_per_sec, one_sec];
-                let arr = CFArrayCreate(std::ptr::null(), limits.as_ptr(), 2, &kCFTypeArrayCallBacks);
-                let st = VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
-                if st != 0 {
-                    tracing::warn!(status = st, "VT rejected DataRateLimits");
-                }
-                CFRelease(arr);
-                CFRelease(bytes_per_sec);
-                CFRelease(one_sec);
+            // Rate control: AverageBitRate target + DataRateLimits ceilings (see `apply_bitrate`).
+            Self::set_num(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64));
+            if let Err(e) = Self::apply_bitrate(session, bitrate) {
+                tracing::warn!("{e}");
             }
             tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, profile, "VT session configured");
             // IDR every 10 seconds — P-frame chains keep bandwidth flat for static desktops
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 10));
+            Self::set_num(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 10));
             // QP ceiling: low-latency RC otherwise lets static desktop text drift blurry (macOS 12+).
-            let st = VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxAllowedFrameQP, cf_i32(36));
+            let st = Self::set_num(session, kVTCompressionPropertyKey_MaxAllowedFrameQP, cf_i32(36));
             if st != 0 {
                 tracing::debug!(status = st, "VT rejected MaxAllowedFrameQP (needs macOS 12+)");
             }
@@ -956,12 +1023,14 @@ impl VtEncoder {
         }
     }
 
-    /// Compute PTS and duration for the current frame.
-    fn make_pts_duration(&self) -> (CMTime, CMTime) {
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let duration = CMTime::make(frame_duration, 600);
-        (pts, duration)
+    /// Next (PTS, duration): PTS = real elapsed µs since `t0`, bumped by 1 µs if it would not
+    /// exceed the previous one; duration = 1/fps. Rate control then budgets by actual elapsed
+    /// time, so a frame after an idle gap gets the bytes the gap accumulated.
+    fn next_pts(&mut self) -> (CMTime, CMTime) {
+        let now_us = self.t0.elapsed().as_micros() as i64;
+        let pts_us = now_us.max(self.last_pts_us + 1);
+        self.last_pts_us = pts_us;
+        (CMTime::make(pts_us, 1_000_000), CMTime::make((1_000_000.0 / self.fps as f64) as i64, 1_000_000))
     }
 
     /// Build a force-keyframe properties dict if pending, otherwise return null.
@@ -984,9 +1053,7 @@ impl VtEncoder {
 
 impl VideoEncoder for VtEncoder {
     fn encode_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<EncodedFrame> {
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let duration = CMTime::make(frame_duration, 600);
+        let (pts, duration) = self.next_pts();
 
         // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
         let pixel_buffer = self.create_nv12_vimage(
@@ -1092,9 +1159,7 @@ impl VideoEncoder for VtEncoder {
             self.pending_force_keyframe = true;
         }
 
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
-        let duration = CMTime::make(frame_duration, 600);
+        let (pts, duration) = self.next_pts();
 
         // Build frame properties for force keyframe if needed
         let frame_props = if self.pending_force_keyframe {
@@ -1132,6 +1197,12 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn encode_bgra_444(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<Avc444EncodedFrame> {
+        // Single encoder session, sequential: main then aux 1 µs later on the real-time axis
+        // (session bitrate is 2× for this, see `session_bitrate`).
+        let (main_pts, duration) = self.next_pts();
+        let aux_pts = CMTime::make(main_pts.value + 1, 1_000_000);
+        self.last_pts_us = aux_pts.value;
+
         let bufs = self.yuv444_buf.as_mut()
             .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no YUV444 buffers"))?;
 
@@ -1151,10 +1222,6 @@ impl VideoEncoder for VtEncoder {
             &mut bufs.main_view, &mut bufs.aux_view,
         );
 
-        // Single encoder session, sequential: main (frame 2N) then aux (frame 2N+1).
-        let frame_duration = (600.0 / self.fps as f64) as i64;
-        let duration = CMTime::make(frame_duration, 600);
-
         // Build frame properties dict to force IDR on both streams when requested
         let frame_props = if self.pending_force_keyframe {
             self.pending_force_keyframe = false;
@@ -1171,7 +1238,6 @@ impl VideoEncoder for VtEncoder {
         };
 
         // Step 2: Encode main view — standard YUV420 from B-area split
-        let main_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let main_pb = Self::create_nv12_from_session_pool(
             self.session, w, h,
             &bufs.main_view.y, &bufs.main_view.u, &bufs.main_view.v,
@@ -1185,7 +1251,6 @@ impl VideoEncoder for VtEncoder {
         // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs)
         // Force IDR on aux too if main was forced, to keep both streams in sync
         self.frame_count += 1;
-        let aux_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let aux_pb = Self::create_nv12_from_session_pool(
             self.session, w, h,
             &bufs.aux_view.y, &bufs.aux_view.u, &bufs.aux_view.v,
@@ -1224,10 +1289,12 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {
-        unsafe {
-            VTSessionSetProperty(self.session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate_bps as i32));
+        let bps = Self::session_bitrate(bitrate_bps, self.mode_444);
+        if let Err(e) = unsafe { Self::apply_bitrate(self.session, bps) } {
+            warn_limited!("VideoToolbox bitrate update failed: {e}");
+            return;
         }
-        tracing::debug!(bitrate_mbps = bitrate_bps as f64 / 1_000_000.0, "VideoToolbox bitrate updated");
+        tracing::debug!(bitrate_mbps = bitrate_bps as f64 / 1_000_000.0, session_mbps = bps as f64 / 1_000_000.0, "VideoToolbox bitrate updated");
     }
 
     fn force_keyframe(&mut self) {
@@ -1247,7 +1314,7 @@ impl VideoEncoder for VtEncoder {
             self.session, self.width, self.height,
             data, width, height, stride,
         )?;
-        let (pts, duration) = self.make_pts_duration();
+        let (pts, duration) = self.next_pts();
         let frame_props = self.make_force_keyframe_props();
 
         let result = Self::submit_session_frame(
@@ -1261,7 +1328,7 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn submit_pixel_buffer(&mut self, ptr: *mut std::ffi::c_void) -> Result<()> {
-        let (pts, duration) = self.make_pts_duration();
+        let (pts, duration) = self.next_pts();
         let frame_props = self.make_force_keyframe_props();
 
         let result = Self::submit_session_frame(
