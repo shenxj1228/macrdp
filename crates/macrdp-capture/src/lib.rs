@@ -31,7 +31,7 @@ pub fn open_screen_recording_settings() {
 }
 
 /// A rectangle region
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
@@ -136,46 +136,61 @@ pub struct ScreenCapturer {
     /// The full stream configuration: SCK's updateConfiguration replaces the whole object,
     /// so a frame-rate change must resend size/pixel format/cursor/queue depth too.
     config: SCStreamConfiguration,
+    busy: SckBusy,
+}
+
+/// Set while a helper thread is inside an SCK call on one stream. Cleared by the helper
+/// when SCK finally calls back (also on panic), never by the caller: a hung call must keep
+/// refusing new ones on *that* stream, so a dead stream cannot pile up a thread per retry
+/// (the CG fallback rebuilds the capturer every second) — while other streams are unaffected.
+type SckBusy = Arc<std::sync::atomic::AtomicBool>;
+
+struct SckBusyGuard(SckBusy);
+
+impl Drop for SckBusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn sck_claim(busy: &SckBusy, what: &str) -> Result<SckBusyGuard> {
+    if busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        anyhow::bail!("SCStream {what}: an earlier SCK call on this stream is still hung — not issuing another");
+    }
+    Ok(SckBusyGuard(Arc::clone(busy)))
 }
 
 /// Run a blocking SCK call (whose crate wrapper waits unbounded on the completion callback)
 /// on a helper thread and give up after `timeout`. The helper thread keeps waiting and exits
 /// when SCK finally calls back; only the caller is unblocked. If the call succeeds after the
 /// caller gave up, `undo_late` runs on the helper thread (e.g. stop a stream nobody owns).
-/// At most `MAX_SCK_IN_FLIGHT` helpers may be alive: a dead SCK must not grow a thread per
-/// retry (the CG fallback rebuilds the capturer every second).
+/// The channel is a rendezvous (`sync_channel(0)`): once the caller has timed out and dropped
+/// the receiver, `send` fails, so a late success can never slip through unnoticed.
 fn sck_call_timeout<T: Send + 'static>(
+    busy: &SckBusy,
     what: &'static str,
     timeout: std::time::Duration,
     f: impl FnOnce() -> Result<T, screencapturekit::prelude::SCError> + Send + 'static,
     undo_late: impl FnOnce() + Send + 'static,
 ) -> Result<T> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-    const MAX_SCK_IN_FLIGHT: usize = 4;
-    if IN_FLIGHT.load(Ordering::Relaxed) >= MAX_SCK_IN_FLIGHT {
-        anyhow::bail!("SCStream {what}: {MAX_SCK_IN_FLIGHT} earlier SCK calls still hung — not issuing another");
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-    let spawned = std::thread::Builder::new()
+    let guard = sck_claim(busy, what)?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    std::thread::Builder::new()
         .name(format!("sck-{what}"))
         .spawn(move || {
+            let _guard = guard;
             let r = f();
-            IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
             if let Err(std::sync::mpsc::SendError(Ok(_))) = tx.send(r) {
                 tracing::warn!("SCStream {what} completed after the caller gave up");
                 undo_late();
             }
-        });
-    if let Err(e) = spawned {
-        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-        return Err(e).context("spawn SCK helper thread");
-    }
+        })
+        .context("spawn SCK helper thread")?;
     match rx.recv_timeout(timeout) {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(anyhow::anyhow!("SCStream {what} failed: {e:?}")),
-        Err(_) => Err(anyhow::anyhow!("SCStream {what} timed out after {timeout:?}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!("SCStream {what} timed out after {timeout:?}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!("SCStream {what} helper thread panicked")),
     }
 }
 
@@ -264,6 +279,25 @@ impl<T> LatestSlot<T> {
     }
 }
 
+/// Past this many merged dirty rects, one bounding box is cheaper for everyone downstream.
+pub const MAX_MERGED_DIRTY_RECTS: usize = 16;
+
+/// Drop exact duplicates from a merged dirty-rect list; collapse to the bounding box when
+/// the list is still longer than [`MAX_MERGED_DIRTY_RECTS`]. Never leaves the list empty
+/// (empty means "whole frame").
+pub fn compact_dirty_rects(rects: &mut Vec<Rect>) {
+    rects.sort_unstable_by_key(|r| (r.x, r.y, r.width, r.height));
+    rects.dedup();
+    if rects.len() > MAX_MERGED_DIRTY_RECTS {
+        let x0 = rects.iter().map(|r| r.x).min().unwrap_or(0);
+        let y0 = rects.iter().map(|r| r.y).min().unwrap_or(0);
+        let x1 = rects.iter().map(|r| r.x.saturating_add(r.width)).max().unwrap_or(0);
+        let y1 = rects.iter().map(|r| r.y.saturating_add(r.height)).max().unwrap_or(0);
+        rects.clear();
+        rects.push(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+    }
+}
+
 struct VideoOutputHandler {
     slot: Arc<LatestSlot<CaptureEvent>>,
     pixel_format: CapturePixelFormat,
@@ -302,6 +336,7 @@ impl SCStreamOutputTrait for VideoOutputHandler {
                         new.dirty_rects.clear();
                     } else {
                         new.dirty_rects.extend(old.dirty_rects.iter().cloned());
+                        compact_dirty_rects(&mut new.dirty_rects);
                     }
                 }
             }),
@@ -664,11 +699,17 @@ impl ScreenCapturer {
         }
 
         let stream = Arc::new(stream);
+        let busy: SckBusy = Arc::default();
         {
-            let (s, late) = (Arc::clone(&stream), Arc::clone(&stream));
+            let (s, late, b) = (Arc::clone(&stream), Arc::clone(&stream), Arc::clone(&busy));
             // Started after we gave up: nobody owns it, stop it instead of leaving it rendering.
-            sck_call_timeout("startCapture", std::time::Duration::from_secs(5), move || s.start_capture(), move || { let _ = late.stop_capture(); })
-                .context("Failed to start capture")?;
+            // The up-to-5 s wait runs on the blocking pool so a current_thread runtime keeps
+            // serving input/ACKs/accept meanwhile.
+            tokio::task::spawn_blocking(move || {
+                sck_call_timeout(&b, "startCapture", std::time::Duration::from_secs(5), move || s.start_capture(), move || { let _ = late.stop_capture(); })
+            })
+            .await?
+            .context("Failed to start capture")?;
         }
 
         tracing::info!(
@@ -681,7 +722,7 @@ impl ScreenCapturer {
             "Screen capture started"
         );
 
-        Ok(Self { stream, slot, config: stream_config })
+        Ok(Self { stream, slot, config: stream_config, busy })
     }
 
     /// Receive the next capture event (async, cancellation safe)
@@ -703,7 +744,7 @@ impl ScreenCapturer {
     /// Update capture frame rate at runtime. Blocks until SCK confirms the new
     /// configuration, at most 2 s. Prefer [`Self::set_frame_rate_async`] from tokio tasks.
     pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
-        apply_frame_rate(Arc::clone(&self.stream), self.config.clone(), fps)
+        apply_frame_rate(Arc::clone(&self.stream), self.config.clone(), &self.busy, fps)
     }
 
     /// Same as [`Self::set_frame_rate`] but runs the blocking SCK call on
@@ -711,28 +752,46 @@ impl ScreenCapturer {
     pub async fn set_frame_rate_async(&self, fps: u32) -> anyhow::Result<()> {
         let stream = Arc::clone(&self.stream);
         let config = self.config.clone();
-        tokio::task::spawn_blocking(move || apply_frame_rate(stream, config, fps)).await?
+        let busy = Arc::clone(&self.busy);
+        tokio::task::spawn_blocking(move || apply_frame_rate(stream, config, &busy, fps)).await?
     }
 }
 
 impl Drop for ScreenCapturer {
     /// Stop the SCStream so a replaced capturer does not keep rendering into its IOSurface
     /// pool. `close()` only closes the slot, so this is the single stop call.
+    ///
+    /// Fire and forget: the stop runs on a helper thread and we never wait for it, since a
+    /// hung SCK would otherwise stall the (current_thread) runtime that drops us.
     fn drop(&mut self) {
         self.slot.close();
+        let guard = match sck_claim(&self.busy, "stopCapture") {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, "Screen capture stop");
+                return;
+            }
+        };
         let stream = Arc::clone(&self.stream);
-        if let Err(e) = sck_call_timeout("stopCapture", std::time::Duration::from_secs(2), move || stream.stop_capture(), || {}) {
-            tracing::warn!(error = %e, "Screen capture stop");
+        let spawned = std::thread::Builder::new().name("sck-stopCapture".into()).spawn(move || {
+            let _guard = guard;
+            if let Err(e) = stream.stop_capture() {
+                tracing::warn!(error = ?e, "Screen capture stop");
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "Screen capture stop: spawn SCK helper thread");
         }
     }
 }
 
-/// `config` is a retained reference to the capturer's own configuration object (SCK clones
-/// on retain, not copy), so only the interval changes and every other field stays as built.
-fn apply_frame_rate(stream: Arc<SCStream>, mut config: SCStreamConfiguration, fps: u32) -> anyhow::Result<()> {
+/// `config` is a retained reference to the capturer's own configuration object
+/// (`SCStreamConfiguration::clone` retains the same ObjC object, it does not copy), so only
+/// the interval changes and every other field stays as built.
+fn apply_frame_rate(stream: Arc<SCStream>, mut config: SCStreamConfiguration, busy: &SckBusy, fps: u32) -> anyhow::Result<()> {
     let interval = CMTime::new(1, fps as i32);
     config.set_minimum_frame_interval(&interval);
-    sck_call_timeout("updateConfiguration", std::time::Duration::from_secs(2), move || stream.update_configuration(&config), || {})
+    sck_call_timeout(busy, "updateConfiguration", std::time::Duration::from_secs(2), move || stream.update_configuration(&config), || {})
         .context("Failed to update SCStream frame rate")?;
     tracing::info!(fps, "Capture frame rate updated");
     Ok(())
@@ -975,26 +1034,33 @@ mod tests {
     /// queueDepth to their defaults; the capturer therefore resends its own full config.
     #[tokio::test]
     async fn frame_rate_update_keeps_stream_config() {
-        let mut cap = match ScreenCapturer::new(
+        // Only a missing TCC grant is a legitimate skip; any `new()` failure past that is a bug.
+        if let Err(e) = SCShareableContent::get() {
+            eprintln!("skipped: no Screen Recording permission: {e:?}");
+            return;
+        }
+        let mut cap = ScreenCapturer::new(
             CaptureConfig { width: 0, height: 0, frame_rate: 30, pixel_format: CapturePixelFormat::Nv12Full, show_cursor: false },
             None,
-        ).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("skipped: cannot start capture (Screen Recording permission?): {e:#}");
-                return;
-            }
-        };
+        ).await.unwrap();
         let before = next_pixel_frame(&mut cap).await;
         assert_eq!(before.0, u32::from_be_bytes(*b"420f"), "initial frame is not NV12 420f");
         cap.set_frame_rate_async(5).await.unwrap();
-        // A config change makes SCK emit a fresh frame; the first one may still be from the
-        // old config, so look at a couple of frames.
-        let mut after = next_pixel_frame(&mut cap).await;
-        for _ in 0..2 {
-            after = next_pixel_frame(&mut cap).await;
-        }
+        // A config change makes SCK emit one fresh frame even on a static desktop; waiting
+        // for more would hang there, so check exactly one (10 s timeout inside).
+        let after = next_pixel_frame(&mut cap).await;
         assert_eq!(after, before, "frame rate update changed pixel format or size");
+    }
+
+    #[test]
+    fn compact_dirty_rects_dedups_then_collapses() {
+        let r = |x, y| Rect { x, y, width: 10, height: 10 };
+        let mut v = vec![r(0, 0), r(5, 5), r(0, 0)];
+        compact_dirty_rects(&mut v);
+        assert_eq!(v, vec![r(0, 0), r(5, 5)]);
+        let mut v: Vec<Rect> = (0..MAX_MERGED_DIRTY_RECTS as u32 + 1).map(|i| r(i * 10, 3)).collect();
+        compact_dirty_rects(&mut v);
+        assert_eq!(v, vec![Rect { x: 0, y: 3, width: MAX_MERGED_DIRTY_RECTS as u32 * 10 + 10, height: 10 }]);
     }
 }
 
