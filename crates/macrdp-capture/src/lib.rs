@@ -470,8 +470,10 @@ impl ScreenCapturer {
             .with_width(actual_width)
             .with_height(actual_height)
             .with_scales_to_fit(needs_scale)
-            // Depth 2 instead of default 3: one fewer buffered frame (~1 frame interval less latency)
-            .with_queue_depth(2)
+            // The IOSurface pool size equals queueDepth (valid range 3-8). The server holds
+            // two surfaces at once (last_frame_cache clone + VT in-flight frame), so 4 leaves
+            // two for SCK to write into; anything less starves the pool and SCK drops frames.
+            .with_queue_depth(4)
             // Match the encoder: BT.601 matrix, sRGB primaries.
             // Values are the CFString contents of kCGDisplayStreamYCbCrMatrix_ITU_R_601_4 / kCGColorSpaceSRGB.
             .with_color_matrix("ITU_R_601_4")
