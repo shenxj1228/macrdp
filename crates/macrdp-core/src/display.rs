@@ -379,7 +379,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 let elapsed = self.last_idr_time.elapsed();
                 if elapsed >= IDLE_IDR_INTERVAL {
                     // IDR keepalive is overdue — send it immediately
-                    if let Some(update) = self.send_idle_idr().await? {
+                    if let Some(update) = self.send_idle_idr(true).await? {
                         return Ok(Some(update));
                     }
                     // Nothing to send (no encoder / GFX not AVC-capable): re-arm so we
@@ -418,7 +418,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     }
                     Ok(Err(_elapsed)) => {
                         // Timeout — idle IDR keepalive
-                        if let Some(update) = self.send_idle_idr().await? {
+                        if let Some(update) = self.send_idle_idr(true).await? {
                             return Ok(Some(update));
                         }
                         // No encoder/GFX available — re-armed by the deadline logic above
@@ -476,6 +476,16 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
                 macrdp_capture::CaptureEvent::Idle => {
                     self.idle_frame_count += 1;
+                    // First idle after activity: SCK only delivers frames on change, so the last
+                    // frame of a scroll/typing burst (high QP under low-latency RC) would stay
+                    // blurry forever. Re-encode it once as a P-frame so the encoder refines it.
+                    // Not while a keyframe is pending (stale surface) or in AVC444 (the single
+                    // VT session alternates main/aux; a 420 P-frame would reference the aux view).
+                    if self.idle_frame_count == 1 && !self.keyframe_requested && !self.mode_444 {
+                        if let Some(update) = self.send_idle_idr(false).await? {
+                            return Ok(Some(update));
+                        }
+                    }
                     continue;
                 }
             };
@@ -622,10 +632,13 @@ impl MacDisplayUpdates {
         }
     }
 
-    /// Re-encode the cached last frame as an IDR keyframe (keepalive during idle).
+    /// Re-encode the cached last frame: as an IDR keyframe (`force_kf`, idle keepalive / resume)
+    /// or as a refinement P-frame (first idle after activity). The cache itself is unchanged.
     /// Returns `None` if no cached frame or the client cannot take H.264 over GFX.
-    async fn send_idle_idr(&mut self) -> Result<Option<DisplayUpdate>> {
-        if self.suppressed || !self.gfx_state.lock().unwrap().avc420_supported() {
+    async fn send_idle_idr(&mut self, force_kf: bool) -> Result<Option<DisplayUpdate>> {
+        // `bitmap_fallback` covers the window where GFX negotiated late but the stream has not
+        // yet switched over (next live frame does) — a refinement P-frame there has no IDR to reference.
+        if self.suppressed || self.bitmap_fallback || !self.gfx_state.lock().unwrap().avc420_supported() {
             return Ok(None);
         }
         let Some(cache) = self.last_frame_cache.as_ref() else { return Ok(None) };
@@ -638,10 +651,7 @@ impl MacDisplayUpdates {
 
         let t0 = Instant::now();
         let result = self
-            .with_encoder_blocking(move |enc| {
-                enc.force_keyframe();
-                input.encode(enc, true)
-            })
+            .with_encoder_blocking(move |enc| input.encode(enc, force_kf))
             .await;
 
         match result {
@@ -649,29 +659,32 @@ impl MacDisplayUpdates {
                 let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 tracing::debug!(
                     h264_bytes = encoded.data.len(),
+                    is_keyframe = encoded.is_keyframe,
                     encode_ms = format!("{:.1}", encode_ms),
                     idle_frames = self.idle_frame_count,
-                    "Sent idle IDR keepalive"
+                    "{}", if force_kf { "Sent idle IDR keepalive" } else { "Sent idle refinement P-frame" }
                 );
-                self.last_idr_time = Instant::now();
-                // This IDR already repaints the whole surface — no second one on the next live frame.
-                self.keyframe_requested = false;
+                if encoded.is_keyframe {
+                    self.last_idr_time = Instant::now();
+                    // This IDR already repaints the whole surface — no second one on the next live frame.
+                    self.keyframe_requested = false;
+                }
                 Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                     h264_data: encoded.data,
                     width: vis_w,
                     height: vis_h,
                     enc_width: encoded.width as u16,
                     enc_height: encoded.height as u16,
-                    is_keyframe: true,
+                    is_keyframe: encoded.is_keyframe,
                     h264_aux: None,
                 })))
             }
             Ok(_) => {
-                macrdp_encode::warn_limited!("Idle IDR encode returned empty data");
+                macrdp_encode::warn_limited!(force_kf, "Idle re-encode returned empty data");
                 Ok(None)
             }
             Err(e) => {
-                macrdp_encode::warn_limited!("Idle IDR encode failed: {e}");
+                macrdp_encode::warn_limited!(force_kf, "Idle re-encode failed: {e}");
                 Ok(None)
             }
         }
@@ -829,6 +842,23 @@ impl MacDisplayUpdates {
             self.display_frame_count = 0;
             if let Some(enc) = &mut self.encoder {
                 enc.force_keyframe();
+            }
+        }
+
+        // AVC444 configured but this client negotiated without it: the 444 encoder session
+        // (align16 size, 2× bitrate, BGRA capture + per-frame vImage conversion) buys nothing.
+        // Rebuild as AVC420 once per stream — `rebuild_encoder` also switches capture to NV12
+        // zero-copy when the new encoder takes pixel buffers. `mode_444` stays false afterwards.
+        if self.mode_444 && !self.bitmap_fallback {
+            let drop_444 = {
+                let gs = self.gfx_state.lock().unwrap();
+                gs.is_ready() && !gs.avc444_supported()
+            };
+            if drop_444 {
+                tracing::info!("Client has no AVC444 — switching this stream to AVC420 (zero-copy capture)");
+                self.mode_444 = false;
+                self.enc_params.mode_444 = false;
+                self.rebuild_encoder().await;
             }
         }
 
