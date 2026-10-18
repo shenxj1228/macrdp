@@ -224,8 +224,6 @@ impl RdpServerDisplay for MacDisplay {
             last_frame_cache: None,
             bitrate_ctrl,
             last_applied_fps: initial_fps,
-            has_pending_submit: false,
-            pending_frame_time: None,
             perf_stats: self.perf_stats.clone(),
             session_start: Instant::now(),
             bitmap_fallback: false,
@@ -257,10 +255,42 @@ impl EncoderParams {
     }
 }
 
-/// Cached frame data for idle IDR re-encoding.
+/// Cached frame data for idle IDR re-encoding (also the owned encoder input for the blocking pool).
 enum CachedFrame {
     Bgra { data: Bytes, width: u32, height: u32, stride: usize },
     PixelBuffer(SafePixelBuffer, u32, u32), // buffer, width, height
+}
+
+impl CachedFrame {
+    fn from_frame(frame: &CapturedFrame) -> Self {
+        match &frame.data {
+            FrameData::PixelBuffer(buf) => CachedFrame::PixelBuffer(buf.clone_ref(), frame.width, frame.height),
+            FrameData::Raw(bgra) => CachedFrame::Bgra {
+                data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
+            },
+        }
+    }
+
+    /// Cheap owned copy: Bytes is refcounted, PixelBuffer gets its own retain.
+    fn clone_ref(&self) -> Self {
+        match self {
+            CachedFrame::Bgra { data, width, height, stride } => {
+                CachedFrame::Bgra { data: data.clone(), width: *width, height: *height, stride: *stride }
+            }
+            CachedFrame::PixelBuffer(buf, w, h) => CachedFrame::PixelBuffer(buf.clone_ref(), *w, *h),
+        }
+    }
+
+    /// AVC420 encode of this frame (synchronous; zero-copy for PixelBuffer).
+    fn encode(&self, enc: &mut dyn VideoEncoder, force_keyframe: bool) -> Result<macrdp_encode::EncodedFrame> {
+        if force_keyframe {
+            enc.force_keyframe();
+        }
+        match self {
+            CachedFrame::Bgra { data, width, height, stride } => enc.encode_bgra(data, *width, *height, *stride),
+            CachedFrame::PixelBuffer(buf, ..) => enc.encode_pixel_buffer(buf.as_ptr(), false),
+        }
+    }
 }
 
 /// IDR keepalive interval during idle scenes. GFX frame ACKs already guarantee delivery;
@@ -295,10 +325,6 @@ struct MacDisplayUpdates {
     bitrate_ctrl: BitrateController,
     /// Last fps value applied to the capturer (to avoid redundant updates).
     last_applied_fps: u32,
-    /// Whether a pipelined encode has been submitted and not yet collected.
-    has_pending_submit: bool,
-    /// Timestamp of the pending pipelined submit (for encode-time measurement).
-    pending_frame_time: Option<Instant>,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
     /// When this update stream was created (GFX negotiation grace period).
@@ -335,7 +361,9 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // Drain stale frames — always use the latest available frame.
         // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
         // which works at the display level (including lock screen).
-        let frame = loop {
+        // Never returns `Ok(None)` — the server treats that as disconnect; a skipped frame
+        // (`encode_and_send` → `None`) just loops for the next one.
+        loop {
             // Calculate timeout for idle IDR keepalive.
             // If we have a cached frame and are in idle state, wait at most until
             // the next IDR keepalive is due instead of blocking forever.
@@ -356,15 +384,6 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             } else {
                 None
             };
-            // Pipeline tail: the last submitted frame has no successor to collect it, and a
-            // static desktop yields no SCK event — wait at most one frame interval for it.
-            let idle_deadline = if self.has_pending_submit {
-                let frame_interval = Duration::from_secs(1) / self.last_applied_fps.max(1);
-                Some(idle_deadline.map_or(frame_interval, |d| d.min(frame_interval)))
-            } else {
-                idle_deadline
-            };
-
             // Cursor shape changes preempt frame waiting (mpsc recv on both sides is cancel-safe).
             let (cur, cap) = (&mut self.cursor, &mut self.capturer);
             let cursor_changed = async {
@@ -390,8 +409,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         continue;
                     }
                     Ok(Err(_elapsed)) => {
-                        // Timeout — collect the pipeline tail if any, else idle IDR keepalive
-                        // (send_idle_idr collects a pending submit first and returns it).
+                        // Timeout — idle IDR keepalive
                         if let Some(update) = self.send_idle_idr().await? {
                             return Ok(Some(update));
                         }
@@ -423,16 +441,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 macrdp_capture::CaptureEvent::Frame(f) => {
                     // Desktop became active — reset idle counter
                     if self.idle_frame_count > 0 {
-                        // A still-pending pipelined frame is collected (and returned) by
-                        // encode_and_send when it submits this frame — never dropped here.
+                        // No forced IDR here: TCP is reliable and the reference chain is intact;
+                        // an IDR after every typing pause is 5-20× a P-frame (latency spike, high QP).
                         tracing::debug!(
                             idle_frames = self.idle_frame_count,
-                            "Desktop active again — forcing keyframe for clean recovery"
+                            "Desktop active again — restoring bitrate/fps"
                         );
-                        if let Some(enc) = &mut self.encoder {
-                            enc.force_keyframe();
-                        }
-                        self.keyframe_requested = true;
 
                         // Reset BitrateController and restore initial bitrate/fps
                         self.bitrate_ctrl.on_idle_recovery();
@@ -450,13 +464,6 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
                 macrdp_capture::CaptureEvent::Idle => {
                     self.idle_frame_count += 1;
-                    // Pipeline tail: the last submitted frame has no successor to collect it.
-                    if self.has_pending_submit {
-                        let (w, h) = self.cached_frame_size();
-                        if let Some(update) = self.collect_and_send_pending(w, h).await? {
-                            return Ok(Some(update));
-                        }
-                    }
                     continue;
                 }
             };
@@ -467,17 +474,17 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             while let Some(macrdp_capture::CaptureEvent::Frame(newer)) = self.capturer.try_next_frame() {
                 frame = newer;
             }
-            break frame;
-        };
-
-        self.encode_and_send(frame).await
+            if let Some(update) = self.encode_and_send(frame).await? {
+                return Ok(Some(update));
+            }
+        }
     }
 }
 
 impl MacDisplayUpdates {
     /// SCStream stopped (lock screen?) — serve one CoreGraphics frame, retrying the SCStream
-    /// rebuild at most every `SCK_RETRY_INTERVAL`. Returns `None` once SCK has recovered
-    /// (caller resumes the normal path), `Some(update)` for a CG frame.
+    /// rebuild at most every `SCK_RETRY_INTERVAL`. Returns `None` once SCK has recovered or
+    /// the CG frame produced no output (caller loops), `Some(update)` for a CG frame.
     async fn cg_fallback_update(&mut self) -> Result<Option<DisplayUpdate>> {
         self.idle_frame_count = 0;
         let fallback = CgFallbackCapturer::new(&self.capture_config);
@@ -534,8 +541,6 @@ impl MacDisplayUpdates {
     async fn rebuild_encoder(&mut self) {
         self.encoder = self.enc_params.create();
         self.keyframe_requested = true;
-        self.has_pending_submit = false;
-        self.pending_frame_time = None;
 
         let zero_copy = self.encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444;
         let want = if zero_copy {
@@ -561,7 +566,7 @@ impl MacDisplayUpdates {
         }
     }
 
-    /// Size of the cached last frame (also the size of any pending pipelined submit).
+    /// Size of the cached last frame.
     fn cached_frame_size(&self) -> (u16, u16) {
         match &self.last_frame_cache {
             Some(CachedFrame::Bgra { width, height, .. }) => (*width as u16, *height as u16),
@@ -573,13 +578,6 @@ impl MacDisplayUpdates {
     /// Re-encode the cached last frame as an IDR keyframe (keepalive during idle).
     /// Returns `None` if no cached frame or the client cannot take H.264 over GFX.
     async fn send_idle_idr(&mut self) -> Result<Option<DisplayUpdate>> {
-        // A pipelined frame still in flight is newer than the cache — deliver it first.
-        if self.has_pending_submit {
-            let (w, h) = self.cached_frame_size();
-            if let Some(update) = self.collect_and_send_pending(w, h).await? {
-                return Ok(Some(update));
-            }
-        }
         if !self.gfx_state.lock().unwrap().avc420_supported() {
             return Ok(None);
         }
@@ -589,23 +587,13 @@ impl MacDisplayUpdates {
         }
         let (vis_w, vis_h) = self.cached_frame_size();
         // Owned copy for the blocking pool: Bytes is refcounted, PixelBuffer gets its own retain.
-        let input = match cache {
-            CachedFrame::Bgra { data, width, height, stride } => {
-                CachedFrame::Bgra { data: data.clone(), width: *width, height: *height, stride: *stride }
-            }
-            CachedFrame::PixelBuffer(buf, w, h) => CachedFrame::PixelBuffer(buf.clone_ref(), *w, *h),
-        };
+        let input = cache.clone_ref();
 
         let t0 = Instant::now();
         let result = self
             .with_encoder_blocking(move |enc| {
                 enc.force_keyframe();
-                match &input {
-                    CachedFrame::Bgra { data, width, height, stride } => {
-                        enc.encode_bgra(data, *width, *height, *stride)
-                    }
-                    CachedFrame::PixelBuffer(buf, ..) => enc.encode_pixel_buffer(buf.as_ptr(), true),
-                }
+                input.encode(enc, true)
             })
             .await;
 
@@ -677,96 +665,19 @@ impl MacDisplayUpdates {
         }
     }
 
-    /// Collect a previously submitted async (pipelined) encode result and build a GFX DisplayUpdate.
-    async fn collect_and_send_pending(&mut self, frame_width: u16, frame_height: u16) -> Result<Option<DisplayUpdate>> {
-        // Idempotent: nothing in flight (or already collected) → nothing to do.
-        if !self.has_pending_submit || !self.encoder.as_ref().is_some_and(|e| e.supports_pipelining()) {
-            return Ok(None);
-        }
-
-        let collected = match self
-            .with_encoder_blocking(|enc| enc.collect_encoded(Duration::from_millis(32)))
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                macrdp_encode::warn_limited!("Pipelined collect failed: {e} — frame lost");
-                self.has_pending_submit = false;
-                self.pending_frame_time = None;
-                return Ok(Some(DisplayUpdate::DefaultPointer));
-            }
-        };
-        match collected {
-            Some(encoded) if !encoded.data.is_empty() => {
-                let encode_ms = self.pending_frame_time
-                    .map(|t| t.elapsed().as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0);
-                let is_keyframe = encoded.is_keyframe;
-
-                tracing::debug!(
-                    h264_bytes = encoded.data.len(),
-                    is_keyframe,
-                    encode_ms = format!("{:.1}", encode_ms),
-                    "Display: collected pipelined GFX frame"
-                );
-                {
-                    let mut st = self.gfx_state.lock().unwrap();
-                    st.last_encode_ms = encode_ms;
-                    st.last_frame_bytes = encoded.data.len() as u32;
-                }
-                self.bitrate_ctrl.record_frame(crate::bitrate_controller::FrameStats {
-                    encode_ms,
-                    frame_bytes: encoded.data.len() as u32,
-                    is_keyframe,
-                });
-                if let Some(ps) = &self.perf_stats {
-                    ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
-                }
-                self.apply_adaptive_decision().await;
-
-                if is_keyframe {
-                    self.last_idr_time = Instant::now();
-                }
-
-                self.has_pending_submit = false;
-                self.pending_frame_time = None;
-
-                Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                    h264_data: encoded.data,
-                    width: frame_width,
-                    height: frame_height,
-                    enc_width: encoded.width as u16,
-                    enc_height: encoded.height as u16,
-                    is_keyframe,
-                    h264_aux: None,
-                })))
-            }
-            Some(_) => {
-                self.has_pending_submit = false;
-                self.pending_frame_time = None;
-                Ok(Some(DisplayUpdate::DefaultPointer))
-            }
-            None => {
-                macrdp_encode::warn_limited!("Pipelined collect timed out — frame lost");
-                self.has_pending_submit = false;
-                self.pending_frame_time = None;
-                Ok(Some(DisplayUpdate::DefaultPointer))
-            }
-        }
-    }
-
     /// GFX uncompressed path: send raw BGRA rects instead of H.264 (zero encode latency).
     ///
     /// `full = false`: only when the total dirty area is small (≤ UNCOMPRESSED_MAX_PIXELS).
     /// `full = true` (client negotiated GFX without AVC420): no area cap; the whole frame is
     /// sent when dirty-rect info is unavailable or this is the first frame of the stream.
-    /// Returns `None` for PixelBuffer frames, no/too-large dirty rects, or extraction failure.
+    /// Returns `None` for PixelBuffer frames, no/too-large dirty rects, extraction failure, or
+    /// a throttled whole frame (`full` only — nothing to send this round).
     fn try_uncompressed(&mut self, frame: &CapturedFrame, full: bool) -> Option<DisplayUpdate> {
         let whole = macrdp_capture::Rect { x: 0, y: 0, width: frame.width, height: frame.height };
         let whole_frame = full && (frame.dirty_rects.is_empty() || self.display_frame_count == 0);
         if whole_frame {
             if self.last_full_uncompressed.is_some_and(|t| t.elapsed() < FULL_UNCOMPRESSED_MIN_INTERVAL) {
-                return Some(DisplayUpdate::DefaultPointer);
+                return None;
             }
             self.last_full_uncompressed = Some(Instant::now());
         }
@@ -850,7 +761,7 @@ impl MacDisplayUpdates {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
             self.skip_next_frame = false;
-            return Ok(Some(DisplayUpdate::DefaultPointer));
+            return Ok(None);
         }
 
         // Late GFX negotiation: the DVC side still completes caps exchange after our bitmap
@@ -880,11 +791,11 @@ impl MacDisplayUpdates {
 
         if gfx_ready && !use_h264 {
             // Whole frame over GFX uncompressed (no H.264 on this client / no encoder).
-            if let Some(update) = self.try_uncompressed(&frame, true) {
-                return Ok(Some(update));
+            // `None` = throttled or not BGRA → nothing to send for this frame.
+            if !matches!(frame.data, FrameData::Raw(_)) {
+                macrdp_encode::warn_limited!("GFX client without AVC420 and frame is not BGRA — dropping frame");
             }
-            macrdp_encode::warn_limited!("GFX client without AVC420 and frame is not BGRA — dropping frame");
-            return Ok(Some(DisplayUpdate::DefaultPointer));
+            return Ok(self.try_uncompressed(&frame, true));
         }
 
         if use_h264 {
@@ -897,76 +808,40 @@ impl MacDisplayUpdates {
             {
                 self.ack_skip_streak += 1;
                 tracing::debug!(pending_acks, streak = self.ack_skip_streak, "ACK backlog — skipping frame before encode");
-                return Ok(Some(DisplayUpdate::DefaultPointer));
+                return Ok(None);
             }
             self.ack_skip_streak = 0;
-            self.keyframe_requested = false;
 
-            // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely.
-            // Not while a pipelined encode is in flight: the raw rects would land on the
-            // client's surface before the older pending frame and then be painted over.
-            if !self.has_pending_submit {
-                if let Some(update) = self.try_uncompressed(&frame, false) {
-                    return Ok(Some(update));
-                }
+            // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
+            // (a pending keyframe request stays armed for the next H.264 frame).
+            if let Some(update) = self.try_uncompressed(&frame, false) {
+                return Ok(Some(update));
             }
+            // Taken here; re-armed below if the encode produces nothing, so the IDR is not lost.
+            let force_kf = std::mem::replace(&mut self.keyframe_requested, false);
 
-            // ── Pipelining fast-path (checked BEFORE borrowing encoder long-term) ──
-            // Check pipelining support with a short borrow, then handle collect/submit
-            // using &mut self methods that don't conflict with the encoder borrow.
-            let supports_pipeline = self.encoder.as_ref().is_some_and(|e| e.supports_pipelining());
-
-            // AVC444 stays synchronous — only pipeline AVC420 (PixelBuffer or BGRA).
-            let pipeline_444 = matches!(frame.data, FrameData::Raw(_))
-                && use_444
-                && self.encoder.as_ref().unwrap().supports_444();
-            if supports_pipeline && !pipeline_444 {
-                // Collect previous first — `&frame.data` must not be held across this await
-                // (SafePixelBuffer is !Sync, so a reference to it is !Send).
-                let prev_update = if self.has_pending_submit {
-                    self.collect_and_send_pending(frame.width as u16, frame.height as u16).await?
-                } else {
-                    None
-                };
-
-                let t0_pipe = Instant::now();
-                let encoder = self.encoder.as_mut().unwrap();
-                self.last_frame_cache = Some(match &frame.data {
-                    FrameData::PixelBuffer(buf) => {
-                        encoder.submit_pixel_buffer(buf.as_ptr())?;
-                        CachedFrame::PixelBuffer(buf.clone_ref(), frame.width, frame.height)
-                    }
-                    FrameData::Raw(bgra) => {
-                        encoder.submit_bgra(bgra, frame.width, frame.height, frame.stride)?;
-                        CachedFrame::Bgra {
-                            data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
-                        }
-                    }
-                });
-                self.has_pending_submit = true;
-                self.pending_frame_time = Some(t0_pipe);
-                self.display_frame_count += 1;
-
-                // Return previous frame's result (first frame returns DefaultPointer)
-                return Ok(prev_update.or(Some(DisplayUpdate::DefaultPointer)));
-            }
-
-            // ── Synchronous path (BGRA only, also fallback when !supports_pipeline) ──
+            // Synchronous encode on the blocking pool — no pipelining: a one-frame pipeline
+            // costs a fixed 1/fps of latency and makes encode_ms measure the frame interval,
+            // which the bitrate controller then reads as permanent overload.
             if self.encoder.is_some() {
                 self.display_frame_count += 1;
-                let t0 = std::time::Instant::now();
+                let cache = CachedFrame::from_frame(&frame);
 
-                // PixelBuffer frames are only produced for supports_pixel_buffer() encoders (VT),
-                // which always pipeline, so they never reach this path.
-                let FrameData::Raw(bgra) = &frame.data else {
-                    macrdp_encode::warn_limited!("PixelBuffer frame on synchronous encode path — dropping frame");
-                    return Ok(Some(DisplayUpdate::DefaultPointer));
-                };
-
-                // AVC444 dual-stream path (CPU colour conversion + encode → blocking pool)
-                if use_444 && self.encoder.as_ref().is_some_and(|e| e.supports_444()) {
-                    let (data, w, h, stride) = (bgra.clone(), frame.width, frame.height, frame.stride);
-                    match self.with_encoder_blocking(move |enc| enc.encode_bgra_444(&data, w, h, stride)).await {
+                // AVC444 dual-stream path (BGRA only; CPU colour conversion + encode → blocking pool)
+                if let (true, CachedFrame::Bgra { data, width, height, stride }) =
+                    (use_444 && self.encoder.as_ref().is_some_and(|e| e.supports_444()), &cache)
+                {
+                    let (data, w, h, stride) = (data.clone(), *width, *height, *stride);
+                    let t0 = Instant::now();
+                    match self
+                        .with_encoder_blocking(move |enc| {
+                            if force_kf {
+                                enc.force_keyframe();
+                            }
+                            enc.encode_bgra_444(&data, w, h, stride)
+                        })
+                        .await
+                    {
                         Ok(encoded) if !encoded.main_view.data.is_empty() => {
                             let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             let total_bytes = encoded.main_view.data.len() + encoded.aux_view.data.len();
@@ -1007,9 +882,7 @@ impl MacDisplayUpdates {
                                 }
                             }
                             // Cache frame for idle IDR re-encoding
-                            self.last_frame_cache = Some(CachedFrame::Bgra {
-                                data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
-                            });
+                            self.last_frame_cache = Some(cache);
                             if is_keyframe {
                                 self.last_idr_time = Instant::now();
                             }
@@ -1028,7 +901,8 @@ impl MacDisplayUpdates {
                                 display_frame = self.display_frame_count,
                                 "AVC444 encode returned EMPTY data — frame dropped!"
                             );
-                            return Ok(Some(DisplayUpdate::DefaultPointer));
+                            self.keyframe_requested |= force_kf;
+                            return Ok(None);
                         }
                         Err(e) => {
                             macrdp_encode::warn_limited!(display_frame = self.display_frame_count, "AVC444 encode failed: {e}, falling back to AVC420");
@@ -1037,13 +911,12 @@ impl MacDisplayUpdates {
                     }
                 }
 
-                // AVC420 path (default or fallback from AVC444 failure).
-                // OpenH264 is a synchronous CPU encode (~tens of ms); run it on the blocking
-                // pool so the single-threaded server runtime keeps handling input/ACKs meanwhile.
-                let encoded = {
-                    let (data, w, h, stride) = (bgra.clone(), frame.width, frame.height, frame.stride);
-                    self.with_encoder_blocking(move |enc| enc.encode_bgra(&data, w, h, stride)).await
-                };
+                // AVC420 path (default or fallback from AVC444 failure): zero-copy CVPixelBuffer
+                // for VT, BGRA otherwise. Runs on the blocking pool so the single-threaded server
+                // runtime keeps handling input/ACKs meanwhile. encode_ms = wall time of this call.
+                let input = cache.clone_ref();
+                let t0 = Instant::now();
+                let encoded = self.with_encoder_blocking(move |enc| input.encode(enc, force_kf)).await;
                 match encoded {
                     Ok(encoded) if !encoded.data.is_empty() => {
                         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1083,9 +956,7 @@ impl MacDisplayUpdates {
                             }
                         }
                         // Cache frame for idle IDR re-encoding
-                        self.last_frame_cache = Some(CachedFrame::Bgra {
-                            data: bgra.clone(), width: frame.width, height: frame.height, stride: frame.stride,
-                        });
+                        self.last_frame_cache = Some(cache);
                         if is_keyframe {
                             self.last_idr_time = Instant::now();
                         }
@@ -1104,11 +975,13 @@ impl MacDisplayUpdates {
                             display_frame = self.display_frame_count,
                             "H.264 encode returned EMPTY data — frame dropped!"
                         );
-                        return Ok(Some(DisplayUpdate::DefaultPointer));
+                        self.keyframe_requested |= force_kf;
+                        return Ok(None);
                     }
                     Err(e) => {
                         macrdp_encode::warn_limited!(display_frame = self.display_frame_count, "H.264 encode failed: {e}");
-                        return Ok(Some(DisplayUpdate::DefaultPointer));
+                        self.keyframe_requested |= force_kf;
+                        return Ok(None);
                     }
                 }
             }
@@ -1117,7 +990,7 @@ impl MacDisplayUpdates {
             // the GFX channel. Mixing bitmap and GFX in one session causes 0xd06
             // DECOMPRESSION_FAILED, so once we fall back we latch to bitmap for this stream.
             if self.session_start.elapsed() < GFX_NEGOTIATE_TIMEOUT {
-                return Ok(Some(DisplayUpdate::DefaultPointer));
+                return Ok(None);
             }
             tracing::warn!(
                 timeout_secs = GFX_NEGOTIATE_TIMEOUT.as_secs(),
@@ -1132,7 +1005,7 @@ impl MacDisplayUpdates {
             FrameData::Raw(bytes) => bytes,
             FrameData::PixelBuffer(_) => {
                 macrdp_encode::warn_limited!("PixelBuffer frame in bitmap path — should not happen");
-                return Ok(Some(DisplayUpdate::DefaultPointer));
+                return Ok(None);
             }
         };
 
