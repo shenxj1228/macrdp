@@ -28,8 +28,10 @@ pub struct EncodedFrame {
 pub struct Avc444EncodedFrame {
     /// Stream1: Main YUV420 H.264 (luma + downsampled chroma)
     pub main_view: EncodedFrame,
-    /// Stream2: Auxiliary YUV420 H.264 (chroma compensation)
-    pub aux_view: EncodedFrame,
+    /// Stream2: Auxiliary YUV420 H.264 (chroma compensation).
+    /// `None` = aux planes identical to the last sent aux view: send LC=LUMA only, the client
+    /// keeps its previous chroma. Always `Some` on a keyframe.
+    pub aux_view: Option<EncodedFrame>,
 }
 
 /// Quality preset

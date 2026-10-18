@@ -478,8 +478,9 @@ impl GfxHandler {
         let rect = InclusiveRectangle { left: 0, top: 0, right: frame.width, bottom: frame.height };
         let qq = QuantQuality { quantization_parameter: 22, progressive: false, quality: 100 };
 
-        // Choose AVC444 or AVC420 path based on available data and negotiated caps
-        match frame.h264_aux.as_ref().filter(|_| state.avc444_supported && state.avc444_enabled) {
+        // Choose AVC444 or AVC420 path based on the frame and negotiated caps. Without client
+        // AVC444 the Main View alone is a valid AVC420 stream.
+        match frame.h264_aux.as_ref().filter(|_| frame.avc444 && state.avc444_supported && state.avc444_enabled) {
             Some(aux) => {
                 let stream = Avc444BitmapStream {
                     encoding: Encoding::LUMA_AND_CHROMA,
@@ -493,6 +494,19 @@ impl GfxHandler {
                         quant_qual_vals: vec![qq],
                         data: aux,
                     }),
+                };
+                push_wire_to_surface1(&mut out, Codec1Type::Avc444, &rect, stream.size(), |c| stream.encode(c))?;
+            }
+            // Aux view unchanged: LC=LUMA, stream1 only (MS-RDPEGFX 2.2.4.5)
+            None if frame.avc444 && state.avc444_supported && state.avc444_enabled => {
+                let stream = Avc444BitmapStream {
+                    encoding: Encoding::LUMA,
+                    stream1: Avc420BitmapStream {
+                        rectangles: vec![rect.clone()],
+                        quant_qual_vals: vec![qq],
+                        data: &frame.h264_data,
+                    },
+                    stream2: None,
                 };
                 push_wire_to_surface1(&mut out, Codec1Type::Avc444, &rect, stream.size(), |c| stream.encode(c))?;
             }
@@ -997,6 +1011,7 @@ mod tests {
             enc_width: 1920,
             enc_height: 1088,
             is_keyframe: true,
+            avc444: false,
             h264_aux: None,
         };
         assert!(GfxHandler::create_frame_pdu(&mut s, &frame).is_err());
@@ -1112,6 +1127,7 @@ mod tests {
             enc_width: 1280,
             enc_height: 2160,
             is_keyframe: true,
+            avc444: false,
             h264_aux: None,
         };
         let data = GfxHandler::create_frame_pdu(&mut s, &frame).unwrap();

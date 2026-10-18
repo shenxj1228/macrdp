@@ -217,8 +217,12 @@ extern "C" fn encode_callback(
     let ctx = unsafe { &*(ref_con as *const CallbackCtx) };
     // Every exit must signal, otherwise the encoder thread waits out its full timeout.
     // Signalling without an output leaves the slot `None` → caller sees an empty frame.
+    // `has_data` is set while holding `output`: the waiter checks it under the same lock, so
+    // the store+notify cannot slip between its check and its wait (lost wakeup → 32 ms stall).
     let signal_empty = || {
+        let guard = ctx.output.lock().unwrap();
         ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
+        drop(guard);
         ctx.ready.notify_one();
     };
 
@@ -348,9 +352,27 @@ extern "C" fn encode_callback(
     {
         let mut guard = ctx.output.lock().unwrap();
         *guard = Some((annex_b, is_keyframe));
+        ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
     }
-    ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
     ctx.ready.notify_one();
+}
+
+// --- RAII guards: every `?`/early return in the encode paths releases its CF/CV objects ---
+
+/// Owned `CFTypeRef` (null = nothing to release).
+struct CfGuard(CFTypeRef);
+impl Drop for CfGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() { unsafe { CFRelease(self.0); } }
+    }
+}
+
+/// Owned `CVPixelBufferRef` from the session pool.
+struct PixelBufferGuard(CVPixelBufferRef);
+impl Drop for PixelBufferGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() { unsafe { CVPixelBufferRelease(self.0); } }
+    }
 }
 
 // --- YUV444 reusable buffers for AVC444 mode ---
@@ -361,6 +383,10 @@ struct Yuv444Buffers {
     v444: Vec<u8>,
     main_view: crate::yuv444_split::Yuv420Frame,
     aux_view: crate::yuv444_split::Yuv420Frame,
+    /// Aux planes of the last aux view actually encoded (swapped with `aux_view`, no alloc).
+    prev_aux: crate::yuv444_split::Yuv420Frame,
+    /// `prev_aux` holds a view the client has received (main and aux NALs were non-empty).
+    prev_aux_valid: bool,
 }
 
 impl Yuv444Buffers {
@@ -373,7 +399,17 @@ impl Yuv444Buffers {
             v444: vec![128u8; full],
             main_view: crate::yuv444_split::Yuv420Frame::new(width, height),
             aux_view: crate::yuv444_split::Yuv420Frame::new(width, height),
+            prev_aux: crate::yuv444_split::Yuv420Frame::new(width, height),
+            prev_aux_valid: false,
         }
+    }
+
+    /// Aux planes unchanged since the last encoded aux view (memcmp, <1 ms at 4K).
+    fn aux_unchanged(&self) -> bool {
+        self.prev_aux_valid
+            && self.aux_view.y == self.prev_aux.y
+            && self.aux_view.u == self.prev_aux.u
+            && self.aux_view.v == self.prev_aux.v
     }
 }
 
@@ -397,6 +433,13 @@ pub struct VtEncoder {
     mode_444: bool,
     yuv444_buf: Option<Yuv444Buffers>,
     pending_force_keyframe: bool,
+    /// Session rate currently applied (see `session_bitrate`); `set_bitrate` with the same
+    /// value is a no-op.
+    session_bps: u32,
+    /// Frames in a row that came back empty (VT null sample buffer).
+    consecutive_drops: u32,
+    /// DataRateLimits currently reduced to the 1 s window alone (see `adapt_rate_limits`).
+    short_window: bool,
     /// vImage SIMD converter for BGRA→NV12 acceleration.
     vimage: Option<VImageConverter>,
     nv12_y_buf: Vec<u8>,
@@ -418,7 +461,8 @@ impl VtEncoder {
         // NV12 input for both AVC420 and AVC444 (range per `LIMITED_RANGE`).
         // AVC444 uses this single session for both streams, per MS-RDPEGFX
         // ("MUST be encoded using the same encoder").
-        let (session, profile) = Self::create_session(width, height, fps, Self::session_bitrate(bitrate, mode_444), &callback_ctx, K_CV_PIXEL_FORMAT_NV12, max_qp)?;
+        let session_bps = Self::session_bitrate(bitrate, mode_444);
+        let (session, profile) = Self::create_session(width, height, fps, session_bps, &callback_ctx, K_CV_PIXEL_FORMAT_NV12, max_qp)?;
 
         let yuv444_buf = if mode_444 {
             Some(Yuv444Buffers::new(width, height))
@@ -452,6 +496,9 @@ impl VtEncoder {
             mode_444,
             yuv444_buf,
             pending_force_keyframe: false,
+            session_bps,
+            consecutive_drops: 0,
+            short_window: false,
             vimage,
             nv12_y_buf,
             nv12_uv_buf,
@@ -480,16 +527,27 @@ impl VtEncoder {
         if st != 0 {
             anyhow::bail!("VT rejected AverageBitRate: {st}");
         }
+        Self::set_data_rate_limits(session, bps, false)
+    }
+
+    /// DataRateLimits for `bps`: the 1 s pair alone when `short_window`, otherwise 1 s + 100 ms
+    /// (falling back to the 1 s pair if VT rejects the 4-element form).
+    unsafe fn set_data_rate_limits(session: VTCompressionSessionRef, bps: u32, short_window: bool) -> Result<()> {
         let bytes_per_sec = bps as f64 / 8.0;
         let limits = [
             cf_i32((bytes_per_sec * 1.5) as i32), cf_f64(1.0),
             cf_i32((bytes_per_sec * 2.0 * 0.1) as i32), cf_f64(0.1),
         ];
-        let arr = CFArrayCreate(std::ptr::null(), limits.as_ptr(), 4, &kCFTypeArrayCallBacks);
-        let mut st = VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
-        CFRelease(arr);
-        if st != 0 {
-            warn_limited!(status = st, "VT rejected 4-element DataRateLimits, using 1 s window only");
+        let mut st = 0;
+        if !short_window {
+            let arr = CFArrayCreate(std::ptr::null(), limits.as_ptr(), 4, &kCFTypeArrayCallBacks);
+            st = VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
+            CFRelease(arr);
+            if st != 0 {
+                warn_limited!(status = st, "VT rejected 4-element DataRateLimits, using 1 s window only");
+            }
+        }
+        if short_window || st != 0 {
             let arr = CFArrayCreate(std::ptr::null(), limits.as_ptr(), 2, &kCFTypeArrayCallBacks);
             st = VTSessionSetProperty(session, kVTCompressionPropertyKey_DataRateLimits, arr);
             CFRelease(arr);
@@ -499,6 +557,29 @@ impl VtEncoder {
             anyhow::bail!("VT rejected DataRateLimits: {st}");
         }
         Ok(())
+    }
+
+    /// Track empty results (VT dropped the frame, typically a forced IDR that overran the
+    /// 100 ms DataRateLimits window). Two drops in a row → next frame runs with the 1 s window
+    /// alone; the first frame that gets through restores the 100 ms cap.
+    fn adapt_rate_limits(&mut self, dropped: bool) {
+        let want_short = if dropped {
+            self.consecutive_drops += 1;
+            self.consecutive_drops >= 2
+        } else {
+            self.consecutive_drops = 0;
+            false
+        };
+        if want_short == self.short_window {
+            return;
+        }
+        match unsafe { Self::set_data_rate_limits(self.session, self.session_bps, want_short) } {
+            Ok(()) => {
+                self.short_window = want_short;
+                tracing::debug!(short_window = want_short, drops = self.consecutive_drops, "VT DataRateLimits window switched");
+            }
+            Err(e) => warn_limited!("VT DataRateLimits window switch failed: {e}"),
+        }
     }
 
     /// Create a VT compression session with the given parameters.
@@ -967,20 +1048,20 @@ impl VtEncoder {
         (CMTime::make(pts_us, 1_000_000), CMTime::make((1_000_000.0 / self.fps as f64) as i64, 1_000_000))
     }
 
-    /// Build a force-keyframe properties dict if pending, otherwise return null.
-    fn make_force_keyframe_props(&mut self) -> CFDictionaryRef {
+    /// Build a force-keyframe properties dict if pending, otherwise a null guard.
+    fn make_force_keyframe_props(&mut self) -> CfGuard {
         if self.pending_force_keyframe {
             self.pending_force_keyframe = false;
             unsafe {
                 let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
                 let values: [CFTypeRef; 1] = [kCFBooleanTrue];
-                CFDictionaryCreate(
+                CfGuard(CFDictionaryCreate(
                     std::ptr::null(), keys.as_ptr(), values.as_ptr(),
                     1, std::ptr::null(), std::ptr::null(),
-                )
+                ))
             }
         } else {
-            std::ptr::null()
+            CfGuard(std::ptr::null())
         }
     }
 }
@@ -1001,23 +1082,20 @@ impl VideoEncoder for VtEncoder {
         let (pts, duration) = self.next_pts();
 
         // Convert BGRA → NV12 full-range via vImage SIMD (falls back to scalar).
-        let pixel_buffer = self.create_nv12_vimage(
+        let pixel_buffer = PixelBufferGuard(self.create_nv12_vimage(
             self.session, self.width, self.height, data, width, height, stride,
-        )?;
+        )?);
 
         let frame_props = self.make_force_keyframe_props();
 
         let (nal_data, is_keyframe) = Self::encode_session_frame(
-            self.session, &self.callback_ctx, pixel_buffer, pts, duration, self.frame_count,
-            frame_props,
+            self.session, &self.callback_ctx, pixel_buffer.0, pts, duration, self.frame_count,
+            frame_props.0,
         )?;
-
-        if !frame_props.is_null() {
-            unsafe { CFRelease(frame_props); }
-        }
-        unsafe { CVPixelBufferRelease(pixel_buffer); }
+        drop((pixel_buffer, frame_props));
 
         self.frame_count += 1;
+        self.adapt_rate_limits(nal_data.is_empty());
 
         // NAL type diagnostic for first 10 frames
         if self.frame_count <= 10 {
@@ -1098,14 +1176,12 @@ impl VideoEncoder for VtEncoder {
         // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
         let (nal_data, is_keyframe) = Self::encode_session_frame(
             self.session, &self.callback_ctx, pixel_buffer_ptr, pts, duration, self.frame_count,
-            frame_props,
+            frame_props.0,
         )?;
-
-        if !frame_props.is_null() {
-            unsafe { CFRelease(frame_props); }
-        }
+        drop(frame_props);
 
         self.frame_count += 1;
+        self.adapt_rate_limits(nal_data.is_empty());
 
         Ok(EncodedFrame {
             data: Bytes::from(nal_data),
@@ -1119,8 +1195,6 @@ impl VideoEncoder for VtEncoder {
         // Single encoder session, sequential: main then aux 1 µs later on the real-time axis
         // (session bitrate is 2× for this, see `session_bitrate`).
         let (main_pts, duration) = self.next_pts();
-        let aux_pts = CMTime::make(main_pts.value + 1, 1_000_000);
-        self.last_pts_us = aux_pts.value;
         // Force IDR on both streams when requested
         let frame_props = self.make_force_keyframe_props();
 
@@ -1142,41 +1216,59 @@ impl VideoEncoder for VtEncoder {
             w, h,
             &mut bufs.main_view, &mut bufs.aux_view,
         );
+        let aux_unchanged = bufs.aux_unchanged();
 
         // Step 2: Encode main view — standard YUV420 from B-area split
-        let main_pb = Self::create_nv12_from_session_pool(
+        let main_pb = PixelBufferGuard(Self::create_nv12_from_session_pool(
             self.session, w, h,
             &bufs.main_view.y, &bufs.main_view.u, &bufs.main_view.v,
-        )?;
+        )?);
         let (main_nal, main_keyframe) = Self::encode_session_frame(
-            self.session, &self.callback_ctx, main_pb, main_pts, duration, self.frame_count,
-            frame_props,
+            self.session, &self.callback_ctx, main_pb.0, main_pts, duration, self.frame_count,
+            frame_props.0,
         )?;
-        unsafe { CVPixelBufferRelease(main_pb); }
-
-        // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs)
-        // Force IDR on aux too if main was forced, to keep both streams in sync
+        drop(main_pb);
         self.frame_count += 1;
-        let aux_pb = Self::create_nv12_from_session_pool(
-            self.session, w, h,
-            &bufs.aux_view.y, &bufs.aux_view.u, &bufs.aux_view.v,
-        )?;
-        let (aux_nal, aux_keyframe) = Self::encode_session_frame(
-            self.session, &self.callback_ctx, aux_pb, aux_pts, duration, self.frame_count,
-            frame_props,
-        )?;
-        unsafe { CVPixelBufferRelease(aux_pb); }
+        let mut dropped = main_nal.is_empty();
 
-        if !frame_props.is_null() {
-            unsafe { CFRelease(frame_props); }
-        }
-
-        self.frame_count += 1;
+        // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs).
+        // Skipped when the aux planes are byte-identical to the last aux the client got
+        // (LC=LUMA on the wire); an IDR always re-sends it. Force IDR on aux too if main
+        // was forced, to keep both streams in sync.
+        let aux_view = if main_keyframe || !aux_unchanged {
+            let aux_pts = CMTime::make(main_pts.value + 1, 1_000_000);
+            self.last_pts_us = aux_pts.value;
+            let aux_pb = PixelBufferGuard(Self::create_nv12_from_session_pool(
+                self.session, w, h,
+                &bufs.aux_view.y, &bufs.aux_view.u, &bufs.aux_view.v,
+            )?);
+            let (aux_nal, aux_keyframe) = Self::encode_session_frame(
+                self.session, &self.callback_ctx, aux_pb.0, aux_pts, duration, self.frame_count,
+                frame_props.0,
+            )?;
+            drop(aux_pb);
+            self.frame_count += 1;
+            // Empty NAL = VT dropped main or aux: the frame never reaches the client.
+            bufs.prev_aux_valid = !aux_nal.is_empty() && !main_nal.is_empty();
+            std::mem::swap(&mut bufs.aux_view, &mut bufs.prev_aux);
+            dropped |= aux_nal.is_empty();
+            // Dropped aux goes out as LC=LUMA (`None`), never as an empty aux stream.
+            (!aux_nal.is_empty()).then(|| EncodedFrame {
+                data: Bytes::from(aux_nal),
+                is_keyframe: aux_keyframe,
+                width: w, height: h,
+            })
+        } else {
+            None
+        };
+        drop(frame_props);
+        self.adapt_rate_limits(dropped);
 
         tracing::debug!(
             frame = self.frame_count,
             main_bytes = main_nal.len(),
-            aux_bytes = aux_nal.len(),
+            aux_bytes = aux_view.as_ref().map_or(0, |a| a.data.len()),
+            aux_skipped = aux_view.is_none(),
             "AVC444 dual-stream encode"
         );
 
@@ -1186,20 +1278,21 @@ impl VideoEncoder for VtEncoder {
                 is_keyframe: main_keyframe,
                 width: w, height: h,
             },
-            aux_view: EncodedFrame {
-                data: Bytes::from(aux_nal),
-                is_keyframe: aux_keyframe,
-                width: w, height: h,
-            },
+            aux_view,
         })
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {
         let bps = Self::session_bitrate(bitrate_bps, self.mode_444);
+        if bps == self.session_bps {
+            return;
+        }
         if let Err(e) = unsafe { Self::apply_bitrate(self.session, bps) } {
             warn_limited!("VideoToolbox bitrate update failed: {e}");
             return;
         }
+        self.session_bps = bps;
+        self.short_window = false; // apply_bitrate re-installs the 4-element limits
         tracing::debug!(bitrate_mbps = bitrate_bps as f64 / 1_000_000.0, session_mbps = bps as f64 / 1_000_000.0, "VideoToolbox bitrate updated");
     }
 
@@ -1283,6 +1376,73 @@ mod tests {
         // B2: odd width/height must not error and must yield data
         let odd = enc.encode_bgra(&bgra, ew - 1, eh - 1, stride).unwrap();
         assert!(!odd.data.is_empty());
+    }
+
+    /// AVC444: an unchanged aux view is not re-encoded (LC=LUMA); a chroma change or an IDR
+    /// brings it back. Needs a real VT session.
+    #[test]
+    fn vt_avc444_skips_unchanged_aux_view() {
+        let (w, h) = (1280u32, 720u32);
+        let mut enc = VtEncoder::new(w, h, 30.0, 8_000_000, true, crate::DEFAULT_MAX_QP).expect("VT session");
+        let mut bgra = gradient_bgra(w as usize, h as usize);
+        let stride = w as usize * 4;
+
+        let first = enc.encode_bgra_444(&bgra, w, h, stride).unwrap();
+        assert!(first.main_view.is_keyframe && !first.main_view.data.is_empty());
+        assert!(first.aux_view.is_some(), "IDR frame must carry the aux view");
+
+        let same = enc.encode_bgra_444(&bgra, w, h, stride).unwrap();
+        assert!(!same.main_view.data.is_empty());
+        assert!(same.aux_view.is_none(), "identical frame must skip the aux view");
+
+        // Repaint a 64×64 block pure red: chroma (and thus the aux planes) change.
+        for row in 100..164 {
+            for col in 200..264 {
+                let p = (row * w as usize + col) * 4;
+                bgra[p..p + 4].copy_from_slice(&[0, 0, 255, 255]);
+            }
+        }
+        let changed = enc.encode_bgra_444(&bgra, w, h, stride).unwrap();
+        assert!(changed.aux_view.is_some(), "chroma change must re-encode the aux view");
+        assert!(enc.encode_bgra_444(&bgra, w, h, stride).unwrap().aux_view.is_none());
+
+        enc.force_keyframe();
+        let idr = enc.encode_bgra_444(&bgra, w, h, stride).unwrap();
+        assert!(idr.main_view.is_keyframe, "forced keyframe");
+        assert!(idr.aux_view.is_some(), "IDR must re-send the aux view even if unchanged");
+        // A view the client never got cannot serve as the LUMA-only reference.
+        enc.yuv444_buf.as_mut().unwrap().prev_aux_valid = false;
+        assert!(!enc.yuv444_buf.as_ref().unwrap().aux_unchanged());
+        assert!(enc.encode_bgra_444(&bgra, w, h, stride).unwrap().aux_view.is_some(),
+                "invalid prev_aux must force the aux view back");
+    }
+
+    /// Two consecutive VT drops switch DataRateLimits to the 1 s window alone (VT must accept
+    /// the 2-element form live); the next delivered frame restores the 100 ms cap. A same-value
+    /// `set_bitrate` is a no-op, a new value re-installs the 4-element limits.
+    #[test]
+    fn vt_drop_recovery_switches_rate_limit_window() {
+        let mut enc = VtEncoder::new(640, 360, 30.0, 4_000_000, false, crate::DEFAULT_MAX_QP).expect("VT session");
+        enc.adapt_rate_limits(true);
+        assert!(!enc.short_window && enc.consecutive_drops == 1, "one drop is noise");
+        enc.adapt_rate_limits(true);
+        assert!(enc.short_window && enc.consecutive_drops == 2);
+        enc.adapt_rate_limits(true);
+        assert!(enc.short_window, "stays short while drops continue");
+        enc.adapt_rate_limits(false);
+        assert!(!enc.short_window && enc.consecutive_drops == 0, "delivered frame restores 4-element limits");
+
+        enc.adapt_rate_limits(true);
+        enc.adapt_rate_limits(true);
+        assert!(enc.short_window);
+        enc.set_bitrate(4_000_000);
+        assert!(enc.short_window, "same bitrate must be a no-op");
+        enc.set_bitrate(6_000_000);
+        assert!(!enc.short_window && enc.session_bps == 6_000_000);
+
+        // The session still encodes after the limit juggling.
+        let bgra = gradient_bgra(640, 360);
+        assert!(!enc.encode_bgra(&bgra, 640, 360, 640 * 4).unwrap().data.is_empty());
     }
 
     /// E2: ScreenCaptureKit delivers 1920×1080 NV12 buffers (not 16-aligned in height). The

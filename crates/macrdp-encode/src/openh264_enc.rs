@@ -291,12 +291,12 @@ impl VideoEncoder for OpenH264Encoder {
                 width: w,
                 height: h,
             },
-            aux_view: EncodedFrame {
+            aux_view: Some(EncodedFrame {
                 data: aux_nal,
                 is_keyframe: aux_keyframe,
                 width: w,
                 height: h,
-            },
+            }),
         })
     }
 
@@ -378,6 +378,6 @@ mod tests {
         assert!(!f2.data.is_empty());
 
         let f444 = encoder.encode_bgra_444(&bgra, w, h, stride).unwrap();
-        assert!(!f444.main_view.data.is_empty() && !f444.aux_view.data.is_empty());
+        assert!(!f444.main_view.data.is_empty() && !f444.aux_view.unwrap().data.is_empty());
     }
 }

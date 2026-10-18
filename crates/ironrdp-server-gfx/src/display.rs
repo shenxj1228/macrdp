@@ -46,8 +46,10 @@ pub struct GfxFrameUpdate {
     /// H.264 encoded height (aligned to 16)
     pub enc_height: u16,
     pub is_keyframe: bool,
-    /// AVC444 Auxiliary View H.264 data (stream2).
-    /// None = AVC420 mode, Some = AVC444 mode.
+    /// AVC444 mode: `h264_data` is the Main View, wrapped in RFX_AVC444_BITMAP_STREAM.
+    pub avc444: bool,
+    /// AVC444 Auxiliary View H.264 data (stream2). `None` with `avc444` = LC=LUMA: the aux
+    /// view is unchanged and the client reuses its previous chroma.
     pub h264_aux: Option<Bytes>,
 }
 
