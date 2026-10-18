@@ -241,6 +241,8 @@ impl RdpServerDisplay for MacDisplay {
             encode_fail_streak: 0,
             last_set_bitrate: self.base_bitrate,
             capture_format_dirty: false,
+            flush_fail_streak: 0,
+            next_flush_at: Instant::now(),
         }))
     }
 }
@@ -254,7 +256,8 @@ fn build_encoder(cfg: EncoderConfig) -> Option<Box<dyn VideoEncoder>> {
 
 /// `set_frame_rate_async` bounded by `SET_FPS_TIMEOUT`: on a stopped SCStream (CG fallback)
 /// `update_configuration` may never call back; the blocking-pool thread stays stuck, the
-/// display loop must not.
+/// display loop must not. The capturer bounds the SCK call itself as well — this outer
+/// timeout is a belt-and-braces guard that also covers the blocking-pool hop.
 async fn set_fps_with_timeout(capturer: &ScreenCapturer, fps: u32) -> Result<()> {
     match tokio::time::timeout(SET_FPS_TIMEOUT, capturer.set_frame_rate_async(fps)).await {
         Ok(r) => r,
@@ -365,6 +368,11 @@ struct MacDisplayUpdates {
     /// The capture pixel format may no longer match the consumer (late GFX switch: bitmap
     /// fallback forced BGRA, the encoder may take NV12 again). Reconciled by `encode_and_send`.
     capture_format_dirty: bool,
+    /// Consecutive `flush_unsent_cache` replays that were dropped/skipped again (VT rate limit
+    /// refusing a 4K IDR): the next flush waits `flush_backoff(streak)` instead of 100 ms.
+    flush_fail_streak: u32,
+    /// Earliest time for the next flush replay (see `flush_fail_streak`).
+    next_flush_at: Instant,
 }
 
 /// How long to wait for the client to open and negotiate the GFX channel before falling
@@ -386,6 +394,11 @@ const MAX_ACK_SKIP_STREAK: u32 = 10;
 /// Retry interval for flushing an unsent cached frame while SCK delivers no event
 /// (GFX negotiating, uncompressed throttle).
 const CACHE_FLUSH_RETRY: Duration = Duration::from_millis(100);
+/// Flush retry delay after `streak` failed replays: `CACHE_FLUSH_RETRY · 2^streak`, capped at
+/// `IDLE_IDR_INTERVAL` (a flush that keeps being dropped must not re-encode 4K every 100 ms).
+fn flush_backoff(streak: u32) -> Duration {
+    CACHE_FLUSH_RETRY.saturating_mul(1u32 << streak.min(16)).min(IDLE_IDR_INTERVAL)
+}
 /// Consecutive encoder `Err`s after which the encoder is rebuilt.
 const ENCODE_FAIL_REBUILD: u32 = 3;
 /// Upper bound for one `SCStream::update_configuration` call (unbounded condvar wait inside
@@ -405,6 +418,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // Never returns `Ok(None)` — the server treats that as disconnect; a skipped frame
         // (`encode_and_send` → `None`) just loops for the next one.
         loop {
+            // A frame reached the client (live / idle IDR / flush) — the encoder is passing
+            // frames again, so the flush backoff starts over for the next unsent frame.
+            if self.flush_fail_streak > 0 && !self.cache_unsent {
+                self.flush_fail_streak = 0;
+                self.next_flush_at = Instant::now();
+            }
             // Suppress Output edge detection (SCK delivers Idle events even when the desktop is
             // static, so this runs at least once per capture interval — ≤ 1 s while suppressed).
             self.sync_suppressed().await;
@@ -430,9 +449,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             } else {
                 None
             };
-            // An unsent cached frame must go out even if SCK stays silent: poll the flush.
+            // An unsent cached frame must go out even if SCK stays silent: poll the flush (not
+            // before `next_flush_at`; never faster than CACHE_FLUSH_RETRY when the flush is
+            // deferred for another reason, e.g. ACK backlog).
             let idle_deadline = if self.cache_unsent && !self.suppressed {
-                Some(idle_deadline.map_or(CACHE_FLUSH_RETRY, |d| d.min(CACHE_FLUSH_RETRY)))
+                let flush_in = self.next_flush_at.saturating_duration_since(Instant::now()).max(CACHE_FLUSH_RETRY);
+                Some(idle_deadline.map_or(flush_in, |d| d.min(flush_in)))
             } else {
                 idle_deadline
             };
@@ -557,6 +579,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     newer.dirty_rects.clear();
                 } else {
                     newer.dirty_rects.append(&mut frame.dirty_rects);
+                    // Same policy as the capture slot: dedup, >16 rects → one bounding box.
+                    macrdp_capture::compact_dirty_rects(&mut newer.dirty_rects);
                 }
                 frame = newer;
             }
@@ -637,12 +661,12 @@ impl MacDisplayUpdates {
     /// fallback, exactly as a live frame would go). `None` = not possible yet; retried on the
     /// next idle event / `CACHE_FLUSH_RETRY`.
     async fn flush_unsent_cache(&mut self) -> Result<Option<DisplayUpdate>> {
-        if !self.cache_unsent || self.suppressed || self.bitmap_fallback {
+        if !self.cache_unsent || self.suppressed || self.bitmap_fallback || Instant::now() < self.next_flush_at {
             return Ok(None);
         }
-        let (ready, ack_backlog) = {
+        let (ready, avc, ack_backlog) = {
             let gs = self.gfx_state.lock().unwrap();
-            (gs.is_ready(), gs.pending_acks > max_pending_acks(gs.rtt_ewma_ms, self.last_applied_fps))
+            (gs.is_ready(), gs.avc420_supported(), gs.pending_acks > max_pending_acks(gs.rtt_ewma_ms, self.last_applied_fps))
         };
         // GFX still negotiating: `encode_and_send` would only re-cache the frame. After the
         // timeout it latches the bitmap fallback (and BGRA capture) and paints the frame, so a
@@ -651,12 +675,20 @@ impl MacDisplayUpdates {
             return Ok(None);
         }
         // ACK backlog: `encode_and_send` would skip anyway — do not burn the skip streak on the
-        // 100 ms retry; the next ACK (or an exhausted streak) lets the flush through.
-        if ready && ack_backlog && !self.keyframe_requested && self.ack_skip_streak < MAX_ACK_SKIP_STREAK {
+        // 100 ms retry; the next ACK (or an exhausted streak) lets the flush through. Only on
+        // the H.264 path (same condition as `use_h264`): uncompressed frames are not ACK-gated.
+        if ready && avc && self.encoder.is_some() && ack_backlog && !self.keyframe_requested && self.ack_skip_streak < MAX_ACK_SKIP_STREAK {
             return Ok(None);
         }
         let Some(frame) = self.cached_frame() else { return Ok(None) };
-        self.encode_and_send(frame).await
+        let update = self.encode_and_send(frame).await?;
+        if self.cache_unsent {
+            // Replay dropped/skipped again — back off so a frame VT keeps refusing (low rate
+            // limit, 4K IDR) is not re-encoded every 100 ms / every idle event.
+            self.flush_fail_streak = self.flush_fail_streak.saturating_add(1);
+            self.next_flush_at = Instant::now() + flush_backoff(self.flush_fail_streak);
+        }
+        Ok(update)
     }
 
     /// The cached frame as a whole-frame `CapturedFrame` (no dirty rects = everything changed).
@@ -763,9 +795,13 @@ impl MacDisplayUpdates {
         self.ensure_capture_format(zero_copy).await;
     }
 
-    /// NV12 zero-copy capture is only for an encoder that takes pixel buffers (VT) in AVC420.
+    /// NV12 zero-copy capture is only for an encoder that takes pixel buffers (VT) in AVC420,
+    /// and only when the client takes AVC420 at all (a GFX client without it needs BGRA for the
+    /// uncompressed path — switching to NV12 first would rebuild the capturer twice).
     fn wants_nv12(&self) -> bool {
-        self.encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444
+        self.encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer())
+            && !self.mode_444
+            && self.gfx_state.lock().unwrap().avc420_supported()
     }
 
     /// Switch capture between NV12 zero-copy and BGRA (also for clients that take no H.264 at
@@ -1377,7 +1413,16 @@ impl MacDisplayUpdates {
 
 #[cfg(test)]
 mod tests {
-    use super::max_pending_acks;
+    use super::{CACHE_FLUSH_RETRY, IDLE_IDR_INTERVAL, flush_backoff, max_pending_acks};
+
+    #[test]
+    fn flush_backoff_doubles_and_caps() {
+        assert_eq!(flush_backoff(0), CACHE_FLUSH_RETRY);
+        assert_eq!(flush_backoff(1), CACHE_FLUSH_RETRY * 2);
+        assert_eq!(flush_backoff(3), CACHE_FLUSH_RETRY * 8);
+        assert_eq!(flush_backoff(7), IDLE_IDR_INTERVAL); // 12.8 s → capped
+        assert_eq!(flush_backoff(u32::MAX), IDLE_IDR_INTERVAL); // shift stays in range
+    }
 
     #[test]
     fn ack_threshold_tracks_rtt() {
