@@ -272,6 +272,8 @@ pub struct GfxState {
     pub encoder_pref: Option<String>,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
     pub chroma_mode: Option<String>,
+    /// Server config: H.264 per-frame QP ceiling (None = encoder default)
+    pub max_qp: Option<u8>,
 }
 
 impl GfxState {
@@ -308,6 +310,7 @@ impl GfxState {
             resolution: None,
             encoder_pref: None,
             chroma_mode: None,
+            max_qp: None,
         }
     }
 
@@ -412,7 +415,7 @@ impl GfxState {
     /// Clear per-connection session state (channel, caps, frame counters, stats)
     /// while keeping configuration: size, `avc444_enabled`, `peer_addr`, and the
     /// hot-updated `target_bitrate` / `show_cursor` / `resolution` /
-    /// `encoder_pref` / `chroma_mode` values.
+    /// `encoder_pref` / `chroma_mode` / `max_qp` values.
     pub fn reset_session(&mut self) {
         let mut fresh = Self::new(self.width, self.height, self.avc444_enabled);
         fresh.peer_addr = self.peer_addr;
@@ -421,6 +424,7 @@ impl GfxState {
         fresh.resolution = self.resolution.take();
         fresh.encoder_pref = self.encoder_pref.take();
         fresh.chroma_mode = self.chroma_mode.take();
+        fresh.max_qp = self.max_qp;
         *self = fresh;
     }
 }

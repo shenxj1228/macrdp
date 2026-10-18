@@ -7,7 +7,7 @@ use ironrdp_server::{
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, SafePixelBuffer, ScreenCapturer};
-use macrdp_encode::{self, Quality, VideoEncoder};
+use macrdp_encode::{self, EncoderConfig, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -144,8 +144,10 @@ impl RdpServerDisplay for MacDisplay {
         if hot_fps > 0 && hot_fps != self.frame_rate {
             self.frame_rate = hot_fps;
         }
+        let max_qp;
         {
             let mut gs = self.gfx_state.lock().unwrap();
+            max_qp = gs.max_qp.unwrap_or(macrdp_encode::DEFAULT_MAX_QP);
             if let Some(bps) = gs.target_bitrate {
                 self.bitrate_override = Some(bps);
             }
@@ -164,7 +166,7 @@ impl RdpServerDisplay for MacDisplay {
 
         // Create the H.264 encoder first: the capture pixel format depends on what the encoder
         // that was *actually* built accepts (VT→OpenH264 fallback must never be fed NV12).
-        let enc_params = EncoderParams {
+        let enc_params = EncoderConfig {
             width: self.width as u32,
             height: self.height as u32,
             fps: self.frame_rate as f32,
@@ -172,8 +174,9 @@ impl RdpServerDisplay for MacDisplay {
             pref: self.encoder_pref,
             mode_444: self.mode_444,
             bitrate: self.base_bitrate,
+            max_qp,
         };
-        let encoder = enc_params.create();
+        let encoder = build_encoder(enc_params);
         if encoder.is_some() {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
@@ -237,24 +240,11 @@ impl RdpServerDisplay for MacDisplay {
     }
 }
 
-/// Everything needed to (re)build the H.264 encoder for this stream.
-#[derive(Clone, Copy)]
-struct EncoderParams {
-    width: u32,
-    height: u32,
-    fps: f32,
-    quality: Quality,
-    pref: macrdp_encode::EncoderPreference,
-    mode_444: bool,
-    bitrate: u32,
-}
-
-impl EncoderParams {
-    fn create(&self) -> Option<Box<dyn VideoEncoder>> {
-        macrdp_encode::create_encoder(self.width, self.height, self.fps, self.quality, self.pref, self.mode_444, self.bitrate)
-            .map_err(|e| tracing::error!("H.264 encoder creation failed: {e}"))
-            .ok()
-    }
+/// `create_encoder` with the failure logged — a missing encoder means the bitmap/uncompressed path.
+fn build_encoder(cfg: EncoderConfig) -> Option<Box<dyn VideoEncoder>> {
+    macrdp_encode::create_encoder(cfg)
+        .map_err(|e| tracing::error!("H.264 encoder creation failed: {e}"))
+        .ok()
 }
 
 /// Cached frame data for idle IDR re-encoding (also the owned encoder input for the blocking pool).
@@ -310,7 +300,7 @@ struct MacDisplayUpdates {
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
     /// Parameters the encoder was built with — used to rebuild it after a panic/cancel.
-    enc_params: EncoderParams,
+    enc_params: EncoderConfig,
     gfx_state: Arc<Mutex<GfxState>>,
     mode_444: bool,
     display_frame_count: u64,
@@ -596,7 +586,7 @@ impl MacDisplayUpdates {
     /// the synchronous path), switch `capture_config.pixel_format` and rebuild the capturer too;
     /// if that fails, close the old stream so the CG fallback loop retries with the new config.
     async fn rebuild_encoder(&mut self) {
-        self.encoder = self.enc_params.create();
+        self.encoder = build_encoder(self.enc_params);
         self.keyframe_requested = true;
 
         let zero_copy = self.encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444;

@@ -175,12 +175,34 @@ impl EncoderPreference {
     }
 }
 
-/// Create an H.264 encoder based on preference.
-/// When `mode_444` is true, the encoder will initialize dual sessions for AVC444 support.
-pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, preference: EncoderPreference, mode_444: bool, bitrate: u32) -> Result<Box<dyn VideoEncoder>> {
+/// Default per-frame QP ceiling (see `EncoderConfig::max_qp`).
+pub const DEFAULT_MAX_QP: u8 = 36;
+
+/// Everything needed to (re)build an H.264 encoder.
+#[derive(Debug, Clone, Copy)]
+pub struct EncoderConfig {
+    /// Visible frame size (encoders pad/align internally).
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub quality: Quality,
+    pub pref: EncoderPreference,
+    /// Dual-session AVC444 (BGRA input only).
+    pub mode_444: bool,
+    pub bitrate: u32,
+    /// Per-frame QP ceiling (1–51): VT `MaxAllowedFrameQP`, OpenH264 `iMaxQp`. Lower = sharper
+    /// static text at higher bitrate; 36 default, 30–32 for LAN high-clarity.
+    pub max_qp: u8,
+}
+
+/// Create an H.264 encoder based on `cfg.pref`.
+/// When `cfg.mode_444` is true, the encoder will initialize dual sessions for AVC444 support.
+pub fn create_encoder(cfg: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
+    let EncoderConfig { width, height, fps, quality, pref: preference, mode_444, bitrate, max_qp } = cfg;
+    let max_qp = max_qp.clamp(1, 51);
     let enc_w = align16(width);
     let enc_h = align16(height);
-    tracing::info!(width, height, enc_w, enc_h, fps, ?quality, ?preference, mode_444,
+    tracing::info!(width, height, enc_w, enc_h, fps, ?quality, ?preference, mode_444, max_qp,
         bitrate_mbps = bitrate as f64 / 1_000_000.0, "Creating H.264 encoder");
 
     // Auto / Hardware: VideoToolbox GPU encoder. The session takes the *visible* (even) size —
@@ -191,7 +213,7 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
     #[cfg(target_os = "macos")]
     if preference != EncoderPreference::Software {
         let (vt_w, vt_h) = if mode_444 { (enc_w, enc_h) } else { ((width + 1) & !1, (height + 1) & !1) };
-        match VtEncoder::new(vt_w, vt_h, fps, bitrate, mode_444) {
+        match VtEncoder::new(vt_w, vt_h, fps, bitrate, mode_444, max_qp) {
             Ok(encoder) => {
                 tracing::info!(vt_w, vt_h, mode_444, "Using VideoToolbox hardware encoder (GPU)");
                 return Ok(Box::new(encoder));
@@ -204,7 +226,7 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
 
     // Software, or VT fallback: OpenH264 CPU encoder (full P-frame support)
     tracing::info!(enc_w, enc_h, mode_444, "Using OpenH264 software encoder (CPU)");
-    let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444)?;
+    let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444, max_qp)?;
     Ok(Box::new(encoder))
 }
 

@@ -407,7 +407,7 @@ pub struct VtEncoder {
 unsafe impl Send for VtEncoder {}
 
 impl VtEncoder {
-    pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
+    pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool, max_qp: u8) -> Result<Self> {
 
         let callback_ctx = Arc::new(CallbackCtx {
             output: std::sync::Mutex::new(None),
@@ -418,7 +418,7 @@ impl VtEncoder {
         // NV12 input for both AVC420 and AVC444 (range per `LIMITED_RANGE`).
         // AVC444 uses this single session for both streams, per MS-RDPEGFX
         // ("MUST be encoded using the same encoder").
-        let (session, profile) = Self::create_session(width, height, fps, Self::session_bitrate(bitrate, mode_444), &callback_ctx, K_CV_PIXEL_FORMAT_NV12)?;
+        let (session, profile) = Self::create_session(width, height, fps, Self::session_bitrate(bitrate, mode_444), &callback_ctx, K_CV_PIXEL_FORMAT_NV12, max_qp)?;
 
         let yuv444_buf = if mode_444 {
             Some(Yuv444Buffers::new(width, height))
@@ -508,6 +508,7 @@ impl VtEncoder {
         width: u32, height: u32, fps: f32, bitrate: u32,
         callback_ctx: &Arc<CallbackCtx>,
         pixel_format: u32,
+        max_qp: u8,
     ) -> Result<(VTCompressionSessionRef, &'static str)> {
         let mut session: VTCompressionSessionRef = std::ptr::null_mut();
         let profile;
@@ -628,7 +629,7 @@ impl VtEncoder {
             // IDR every 10 seconds — P-frame chains keep bandwidth flat for static desktops
             Self::set_num(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 10));
             // QP ceiling: low-latency RC otherwise lets static desktop text drift blurry (macOS 12+).
-            let st = Self::set_num(session, kVTCompressionPropertyKey_MaxAllowedFrameQP, cf_i32(36));
+            let st = Self::set_num(session, kVTCompressionPropertyKey_MaxAllowedFrameQP, cf_i32(max_qp as i32));
             if st != 0 {
                 tracing::debug!(status = st, "VT rejected MaxAllowedFrameQP (needs macOS 12+)");
             }
@@ -1262,7 +1263,7 @@ mod tests {
     #[test]
     fn vt_session_profile_and_odd_size_encode() {
         let (ew, eh) = (1280u32, 720u32);
-        let mut enc = VtEncoder::new(ew, eh, 30.0, 8_000_000, false).expect("VT session");
+        let mut enc = VtEncoder::new(ew, eh, 30.0, 8_000_000, false, crate::DEFAULT_MAX_QP).expect("VT session");
         let bgra = gradient_bgra(ew as usize, eh as usize);
         let stride = ew as usize * 4;
 
@@ -1291,8 +1292,10 @@ mod tests {
     fn vt_zero_copy_1080_pixel_buffer_decodes_to_visible_size() {
         use openh264::formats::YUVSource;
         let (w, h) = (1920u32, 1080u32);
-        let mut enc = match crate::create_encoder(w, h, 30.0, crate::Quality::Balanced,
-                                                  crate::EncoderPreference::Hardware, false, 8_000_000) {
+        let mut enc = match crate::create_encoder(crate::EncoderConfig {
+            width: w, height: h, fps: 30.0, quality: crate::Quality::Balanced,
+            pref: crate::EncoderPreference::Hardware, mode_444: false, bitrate: 8_000_000, max_qp: crate::DEFAULT_MAX_QP,
+        }) {
             Ok(e) if e.supports_pixel_buffer() => e,
             _ => { println!("skip: no VideoToolbox hardware encoder available"); return; }
         };

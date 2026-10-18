@@ -54,7 +54,7 @@ impl Yuv444SplitBufs {
     }
 }
 
-fn create_oh264_encoder(fps: f32, bitrate: u32) -> Result<Encoder> {
+fn create_oh264_encoder(fps: f32, bitrate: u32, max_qp: u8) -> Result<Encoder> {
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8) as u16;
     // Screen/text tuned: low QP floor keeps glyph edges crisp, no AQ (it smears flat UI regions),
     // no background detection (static desktop must not be classified as "background" and starved).
@@ -64,7 +64,7 @@ fn create_oh264_encoder(fps: f32, bitrate: u32) -> Result<Encoder> {
         .rate_control_mode(openh264::encoder::RateControlMode::Quality)
         .background_detection(false)
         .adaptive_quantization(false)
-        .qp(openh264::encoder::QpRange::new(10, 36))
+        .qp(openh264::encoder::QpRange::new(10.min(max_qp), max_qp))
         .skip_frames(false)
         // Window switches must not force an IDR (bitrate spike); GOP/force_keyframe handle refresh.
         .scene_change_detect(false)
@@ -79,14 +79,14 @@ fn create_oh264_encoder(fps: f32, bitrate: u32) -> Result<Encoder> {
 }
 
 impl OpenH264Encoder {
-    pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
+    pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool, max_qp: u8) -> Result<Self> {
 
-        let encoder = create_oh264_encoder(fps, bitrate)?;
+        let encoder = create_oh264_encoder(fps, bitrate, max_qp)?;
 
         // AVC444: create auxiliary encoder with 70% bitrate
         let encoder_aux = if mode_444 {
             let aux_bitrate = (bitrate as f64 * 0.7) as u32;
-            let aux = create_oh264_encoder(fps, aux_bitrate)?;
+            let aux = create_oh264_encoder(fps, aux_bitrate, max_qp)?;
             tracing::info!(aux_bitrate_mbps = aux_bitrate as f64 / 1_000_000.0, "AVC444 auxiliary OpenH264 encoder created");
             Some(aux)
         } else {
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_encode_frame() {
-        let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 1_000_000, false).unwrap();
+        let mut encoder = OpenH264Encoder::new(64, 64, 30.0, 1_000_000, false, crate::DEFAULT_MAX_QP).unwrap();
         let bgra = vec![128u8; 64 * 64 * 4];
         let frame = encoder.encode_bgra(&bgra, 64, 64, 64 * 4).unwrap();
         assert!(!frame.data.is_empty());
@@ -364,7 +364,7 @@ mod tests {
         // 1366x768 frame into a 1376x768 encoder, both AVC420 and AVC444 paths
         let (w, h) = (1366u32, 768u32);
         let (ew, eh) = (crate::align16(w), crate::align16(h));
-        let mut encoder = OpenH264Encoder::new(ew, eh, 30.0, 4_000_000, true).unwrap();
+        let mut encoder = OpenH264Encoder::new(ew, eh, 30.0, 4_000_000, true, crate::DEFAULT_MAX_QP).unwrap();
         let stride = w as usize * 4;
         let mut bgra = vec![0u8; stride * h as usize];
         for (i, px) in bgra.chunks_mut(4).enumerate() {

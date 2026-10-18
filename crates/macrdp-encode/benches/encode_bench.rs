@@ -150,6 +150,7 @@ fn bench_openh264_encode(c: &mut Criterion) {
             120.0,
             50_000_000,
             false,
+            macrdp_encode::DEFAULT_MAX_QP,
         )
         .expect("Failed to create 4K OpenH264 encoder");
 
@@ -172,6 +173,7 @@ fn bench_openh264_encode(c: &mut Criterion) {
             120.0,
             30_000_000,
             false,
+            macrdp_encode::DEFAULT_MAX_QP,
         )
         .expect("Failed to create 1080p OpenH264 encoder");
 
@@ -342,15 +344,16 @@ fn vt_encode(c: &mut Criterion) {
         let bgra = generate_test_pattern(w, h, stride);
         let bitrate = macrdp_encode::screen_bitrate(w, h, 30.0, Quality::Balanced);
 
-        if let Ok(mut encoder) = create_encoder(
-            w,
-            h,
-            30.0,
-            Quality::Balanced,
-            EncoderPreference::Hardware,
-            false,
+        if let Ok(mut encoder) = create_encoder(macrdp_encode::EncoderConfig {
+            width: w,
+            height: h,
+            fps: 30.0,
+            quality: Quality::Balanced,
+            pref: EncoderPreference::Hardware,
+            mode_444: false,
             bitrate,
-        ) {
+            max_qp: macrdp_encode::DEFAULT_MAX_QP,
+        }) {
             group.bench_function(format!("vt_bgra_{label}_30fps"), |b| {
                 b.iter(|| {
                     let _ = encoder.encode_bgra(black_box(&bgra), w, h, stride);

@@ -78,6 +78,10 @@ pub struct ServerConfig {
     pub cursor_mode: Option<String>,
     /// Target bitrate in Mbps (default: auto-calculated)
     pub bitrate_mbps: Option<u32>,
+    /// Per-frame QP ceiling for the H.264 encoder (VideoToolbox `MaxAllowedFrameQP`, OpenH264
+    /// `iMaxQp`), 1-51 (default: 36). Lower = sharper static text at a higher bitrate; on a LAN
+    /// 30-32 is a good high-clarity setting.
+    pub max_qp: Option<u8>,
     /// Audio forwarding configuration
     #[serde(default)]
     pub audio: AudioConfig,
@@ -106,6 +110,7 @@ impl Default for ServerConfig {
             show_cursor: None,
             cursor_mode: None,
             bitrate_mbps: None,
+            max_qp: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
         }

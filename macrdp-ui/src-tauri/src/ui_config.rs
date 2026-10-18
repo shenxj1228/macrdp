@@ -227,6 +227,7 @@ impl UiConfig {
             show_cursor: Some(self.show_cursor),
             cursor_mode: None,
             bitrate_mbps: Some(self.bitrate_mbps),
+            max_qp: None,
             audio: macrdp_core::AudioConfig::default(),
             clipboard: macrdp_core::ClipboardConfig::default(),
         }

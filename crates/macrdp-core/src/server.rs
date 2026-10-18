@@ -293,6 +293,7 @@ pub async fn start_server_with_perf(
 
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
+    gfx_state.lock().unwrap().max_qp = config.max_qp;
 
     let (listener, port) = find_available_port("0.0.0.0", config.port)?;
     let bind_addr = listener.local_addr()?;
