@@ -60,19 +60,21 @@ impl CursorWatcher {
             .name("cursor-watch".into())
             .spawn(move || {
                 let mut last = 0u64;
-                while !stop_t.load(Ordering::Relaxed) {
-                    let Some(ptr) = grab_system_cursor(scale) else {
-                        tracing::warn!("system cursor unavailable — cursor updates disabled for this session");
-                        return;
-                    };
-                    let h = pointer_hash(&ptr, scale);
-                    if h != last {
-                        last = h;
-                        tracing::debug!(w = ptr.width, h = ptr.height, hot_x = ptr.hot_x, hot_y = ptr.hot_y, "cursor changed");
-                        // Full channel = consumer still holds an older shape; the newest wins
-                        // on the next poll since `last` is only advanced here.
-                        if tx.try_send(ptr).is_err() {
-                            last = 0;
+                // Exits only on stop or once the receiver is gone; a nil cursor (lock screen,
+                // hidden cursor) just skips this poll.
+                while !stop_t.load(Ordering::Relaxed) && !tx.is_closed() {
+                    // AppKit autoreleases the image/rep objects; drain them every poll.
+                    let ptr = objc2::rc::autoreleasepool(|_| grab_system_cursor(scale));
+                    if let Some(ptr) = ptr {
+                        let h = pointer_hash(&ptr, scale);
+                        if h != last {
+                            last = h;
+                            tracing::debug!(w = ptr.width, h = ptr.height, hot_x = ptr.hot_x, hot_y = ptr.hot_y, "cursor changed");
+                            // Full channel = consumer still holds an older shape; the newest wins
+                            // on the next poll since `last` is only advanced here.
+                            if tx.try_send(ptr).is_err() {
+                                last = 0;
+                            }
                         }
                     }
                     std::thread::sleep(POLL_INTERVAL);
