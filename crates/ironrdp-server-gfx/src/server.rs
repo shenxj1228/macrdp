@@ -1078,6 +1078,13 @@ impl RdpServer {
                     return Ok(true);
                 }
 
+                // allowDisplayUpdates == SUPPRESS_DISPLAY_UPDATES carries no desktopRect.
+                rdp::headers::ShareDataPdu::SuppressOutput(pdu) => {
+                    let suppressed = pdu.desktop_rect.is_none();
+                    self.gfx_state.lock().unwrap().output_suppressed = suppressed;
+                    info!(suppressed, "Client suppress output");
+                }
+
                 unexpected => {
                     warn!(?unexpected, "Unexpected share data pdu");
                 }

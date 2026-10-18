@@ -231,6 +231,8 @@ impl RdpServerDisplay for MacDisplay {
             ack_skip_streak: 0,
             last_full_uncompressed: None,
             last_sck_retry: None,
+            shared_audio_tx: self.shared_audio_tx.clone(),
+            suppressed: false,
         }))
     }
 }
@@ -340,13 +342,25 @@ struct MacDisplayUpdates {
     last_full_uncompressed: Option<Instant>,
     /// When SCStream was last (unsuccessfully) rebuilt on the CoreGraphics fallback path.
     last_sck_retry: Option<Instant>,
+    /// Audio sender slot, re-read on every capturer rebuild so audio survives SCStream restarts.
+    shared_audio_tx: Option<SharedAudioTx>,
+    /// Mirror of `GfxState::output_suppressed` as last seen by this stream (edge detection).
+    suppressed: bool,
 }
 
 /// How long to wait for the client to open and negotiate the GFX channel before falling
 /// back to legacy bitmap updates (clients without GFX support would otherwise see black).
 const GFX_NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Skip encoding when more than this many GFX frames await client ACK.
-const MAX_PENDING_ACKS: u32 = 3;
+/// Skip encoding when more than this many GFX frames await client ACK. RTT-adaptive: with a
+/// fixed 3 the frame rate is capped at 3/RTT (≈ 30 fps at 100 ms), so allow about one RTT
+/// worth of frames in flight, bounded to [3, 8]. Unknown RTT → 3.
+fn max_pending_acks(rtt_ms: f64, fps: u32) -> u32 {
+    if rtt_ms <= 0.0 {
+        return 3;
+    }
+    let frame_interval_ms = 1000.0 / fps.max(1) as f64;
+    ((rtt_ms / frame_interval_ms).ceil() as u32 + 1).clamp(3, 8)
+}
 /// Upper bound on consecutive ACK-backlog skips, so a client that suspends frame
 /// acknowledgements (SUSPEND_FRAME_ACKNOWLEDGEMENT) cannot stall the stream.
 const MAX_ACK_SKIP_STREAK: u32 = 10;
@@ -364,10 +378,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
         // Never returns `Ok(None)` — the server treats that as disconnect; a skipped frame
         // (`encode_and_send` → `None`) just loops for the next one.
         loop {
+            // Suppress Output edge detection (SCK delivers Idle events even when the desktop is
+            // static, so this runs at least once per capture interval — ≤ 1 s while suppressed).
+            self.sync_suppressed().await;
             // Calculate timeout for idle IDR keepalive.
             // If we have a cached frame and are in idle state, wait at most until
             // the next IDR keepalive is due instead of blocking forever.
-            let idle_deadline = if self.idle_frame_count > 0 && self.last_frame_cache.is_some() {
+            // Also the path that repaints the client right after suppression ends.
+            let idle_deadline = if self.idle_frame_count > 0 && self.last_frame_cache.is_some() && !self.suppressed {
                 let elapsed = self.last_idr_time.elapsed();
                 if elapsed >= IDLE_IDR_INTERVAL {
                     // IDR keepalive is overdue — send it immediately
@@ -455,7 +473,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         }
                         let target_fps = self.bitrate_ctrl.target_fps();
                         if self.last_applied_fps != target_fps {
-                            let _ = self.capturer.set_frame_rate_async(target_fps).await;
+                            // While suppressed the capturer stays at 1 fps; the restore edge
+                            // in `sync_suppressed` applies `last_applied_fps`.
+                            if !self.suppressed {
+                                let _ = self.capturer.set_frame_rate_async(target_fps).await;
+                            }
                             self.last_applied_fps = target_fps;
                         }
                     }
@@ -482,6 +504,41 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Mirror `GfxState::output_suppressed` and act on the edges: suppressed → capture at
+    /// 1 fps and stop encoding (frames are still cached); restored → previous fps and an
+    /// immediate IDR from the cache (idle-IDR path) plus a keyframe for the next live frame.
+    async fn sync_suppressed(&mut self) {
+        let suppressed = self.gfx_state.lock().unwrap().output_suppressed;
+        if suppressed == self.suppressed {
+            return;
+        }
+        self.suppressed = suppressed;
+        if suppressed {
+            tracing::info!("Client suppressed output — encoding paused, capture at 1 fps");
+            if let Err(e) = self.capturer.set_frame_rate_async(1).await {
+                tracing::warn!("Failed to lower frame rate for suppressed output: {e}");
+            }
+        } else {
+            tracing::info!(fps = self.last_applied_fps, "Client restored output — resuming with keyframe");
+            if let Err(e) = self.capturer.set_frame_rate_async(self.last_applied_fps).await {
+                tracing::warn!("Failed to restore frame rate after suppressed output: {e}");
+            }
+            self.keyframe_requested = true;
+            if self.last_frame_cache.is_some() {
+                self.idle_frame_count = self.idle_frame_count.max(1);
+                self.last_idr_time = Instant::now().checked_sub(IDLE_IDR_INTERVAL).unwrap_or(self.session_start);
+            }
+        }
+    }
+
+    /// New SCStream with the current config and the *current* audio sender (the slot is
+    /// replaced per connection by AudioFactory; passing `None` would silence audio after a
+    /// rebuild).
+    async fn new_capturer(&mut self) -> Result<ScreenCapturer> {
+        let audio_tx = self.shared_audio_tx.as_ref().and_then(|shared| shared.lock().unwrap().clone());
+        ScreenCapturer::new(self.capture_config.clone(), audio_tx).await
+    }
+
     /// SCStream stopped (lock screen?) — serve one CoreGraphics frame, retrying the SCStream
     /// rebuild at most every `SCK_RETRY_INTERVAL`. Returns `None` once SCK has recovered or
     /// the CG frame produced no output (caller loops), `Some(update)` for a CG frame.
@@ -492,7 +549,7 @@ impl MacDisplayUpdates {
             if self.last_sck_retry.is_none_or(|t| t.elapsed() >= SCK_RETRY_INTERVAL) {
                 tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
                 self.last_sck_retry = Some(Instant::now());
-                if let Ok(new_capturer) = ScreenCapturer::new(self.capture_config.clone(), None).await {
+                if let Ok(new_capturer) = self.new_capturer().await {
                     tracing::info!("SCStream recovered — switching back from CoreGraphics");
                     self.capturer = new_capturer;
                     self.last_sck_retry = None;
@@ -557,7 +614,7 @@ impl MacDisplayUpdates {
         );
         self.capture_config.pixel_format = want;
         self.last_frame_cache = None;
-        match ScreenCapturer::new(self.capture_config.clone(), None).await {
+        match self.new_capturer().await {
             Ok(c) => self.capturer = c,
             Err(e) => {
                 tracing::error!("capturer rebuild failed ({e:#}) — closing stream, CG fallback will retry");
@@ -578,7 +635,7 @@ impl MacDisplayUpdates {
     /// Re-encode the cached last frame as an IDR keyframe (keepalive during idle).
     /// Returns `None` if no cached frame or the client cannot take H.264 over GFX.
     async fn send_idle_idr(&mut self) -> Result<Option<DisplayUpdate>> {
-        if !self.gfx_state.lock().unwrap().avc420_supported() {
+        if self.suppressed || !self.gfx_state.lock().unwrap().avc420_supported() {
             return Ok(None);
         }
         let Some(cache) = self.last_frame_cache.as_ref() else { return Ok(None) };
@@ -607,6 +664,8 @@ impl MacDisplayUpdates {
                     "Sent idle IDR keepalive"
                 );
                 self.last_idr_time = Instant::now();
+                // This IDR already repaints the whole surface — no second one on the next live frame.
+                self.keyframe_requested = false;
                 Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                     h264_data: encoded.data,
                     width: vis_w,
@@ -674,12 +733,13 @@ impl MacDisplayUpdates {
     /// a throttled whole frame (`full` only — nothing to send this round).
     fn try_uncompressed(&mut self, frame: &CapturedFrame, full: bool) -> Option<DisplayUpdate> {
         let whole = macrdp_capture::Rect { x: 0, y: 0, width: frame.width, height: frame.height };
-        let whole_frame = full && (frame.dirty_rects.is_empty() || self.display_frame_count == 0);
+        let whole_frame = full && (frame.dirty_rects.is_empty() || self.display_frame_count == 0 || self.keyframe_requested);
         if whole_frame {
             if self.last_full_uncompressed.is_some_and(|t| t.elapsed() < FULL_UNCOMPRESSED_MIN_INTERVAL) {
                 return None;
             }
             self.last_full_uncompressed = Some(Instant::now());
+            self.keyframe_requested = false;
         }
         let dirty_rects: &[macrdp_capture::Rect] = if whole_frame {
             std::slice::from_ref(&whole)
@@ -758,6 +818,11 @@ impl MacDisplayUpdates {
     }
 
     async fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
+        // Client minimized (Suppress Output): keep the newest frame for the restore IDR, encode nothing.
+        if self.suppressed {
+            self.last_frame_cache = Some(CachedFrame::from_frame(&frame));
+            return Ok(None);
+        }
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
             self.skip_next_frame = false;
@@ -779,13 +844,14 @@ impl MacDisplayUpdates {
 
         // GFX negotiated ≠ H.264 capable: `is_ready()` only means the channel is open and caps
         // confirmed; `GfxFrame` needs `avc420_supported()`, otherwise go uncompressed.
-        let (gfx_ready, use_h264, use_444, pending_acks) = {
+        let (gfx_ready, use_h264, use_444, pending_acks, max_pending) = {
             let state = self.gfx_state.lock().unwrap();
             (
                 state.is_ready() && !self.bitmap_fallback,
                 state.avc420_supported() && self.encoder.is_some() && !self.bitmap_fallback,
                 self.mode_444 && state.avc444_supported() && state.avc444_enabled,
                 state.pending_acks,
+                max_pending_acks(state.rtt_ewma_ms, self.last_applied_fps),
             )
         };
 
@@ -802,20 +868,23 @@ impl MacDisplayUpdates {
             // Flow control: skip encoding (not just sending) while the client is behind on
             // ACKs, so the H.264 reference chain stays intact. Keyframes are never skipped,
             // and a client that stopped ACKing cannot stall us past MAX_ACK_SKIP_STREAK.
-            if pending_acks > MAX_PENDING_ACKS
+            if pending_acks > max_pending
                 && !self.keyframe_requested
                 && self.ack_skip_streak < MAX_ACK_SKIP_STREAK
             {
                 self.ack_skip_streak += 1;
-                tracing::debug!(pending_acks, streak = self.ack_skip_streak, "ACK backlog — skipping frame before encode");
+                tracing::debug!(pending_acks, max_pending, streak = self.ack_skip_streak, "ACK backlog — skipping frame before encode");
                 return Ok(None);
             }
             self.ack_skip_streak = 0;
 
-            // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
-            // (a pending keyframe request stays armed for the next H.264 frame).
-            if let Some(update) = self.try_uncompressed(&frame, false) {
-                return Ok(Some(update));
+            // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely.
+            // Not while a keyframe is requested: the client surface may be stale (suppress
+            // output / encoder rebuild), so partial rects must not land before a whole frame.
+            if !self.keyframe_requested {
+                if let Some(update) = self.try_uncompressed(&frame, false) {
+                    return Ok(Some(update));
+                }
             }
             // Taken here; re-armed below if the encode produces nothing, so the IDR is not lost.
             let force_kf = std::mem::replace(&mut self.keyframe_requested, false);
@@ -1009,7 +1078,8 @@ impl MacDisplayUpdates {
             }
         };
 
-        if !frame.dirty_rects.is_empty() {
+        // A pending keyframe request means the client surface is stale → whole frame.
+        if !frame.dirty_rects.is_empty() && !std::mem::take(&mut self.keyframe_requested) {
             // Find bounding box of all dirty rects to send a single update
             let mut min_x = frame.width;
             let mut min_y = frame.height;
@@ -1062,6 +1132,7 @@ impl MacDisplayUpdates {
         }
 
         // No dirty rects available — send full frame (first frame or fallback)
+        self.keyframe_requested = false;
         let Some(width) = NonZeroU16::new(frame.width as u16) else { return Ok(None) };
         let Some(height) = NonZeroU16::new(frame.height as u16) else { return Ok(None) };
         let Some(stride) = NonZeroUsize::new(frame.stride) else { return Ok(None) };
@@ -1077,5 +1148,19 @@ impl MacDisplayUpdates {
         };
 
         Ok(Some(DisplayUpdate::Bitmap(update)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_pending_acks;
+
+    #[test]
+    fn ack_threshold_tracks_rtt() {
+        assert_eq!(max_pending_acks(0.0, 60), 3); // RTT unknown
+        assert_eq!(max_pending_acks(5.0, 60), 3); // LAN: floor
+        assert_eq!(max_pending_acks(40.0, 60), 4); // ceil(40/16.7)=3, +1
+        assert_eq!(max_pending_acks(100.0, 30), 4); // ceil(100/33.3)=3, +1
+        assert_eq!(max_pending_acks(500.0, 60), 8); // ceiling
     }
 }

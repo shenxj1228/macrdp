@@ -254,6 +254,9 @@ pub struct GfxState {
     pub start_time: Option<std::time::Instant>,
     /// Client peer IP address (set after TCP connection is established)
     pub peer_addr: Option<std::net::IpAddr>,
+    /// Client sent Suppress Output PDU without a rect (window minimized): stop encoding
+    /// display updates until it allows them again (MS-RDPBCGR 2.2.11.3.1).
+    pub output_suppressed: bool,
     /// Instantaneous bitrate tracking (per-frame Mbps samples since last log)
     bitrate_samples: Vec<f64>,
     bitrate_max: f64,
@@ -295,6 +298,7 @@ impl GfxState {
             total_bytes_sent: 0,
             start_time: None,
             peer_addr: None,
+            output_suppressed: false,
             bitrate_samples: Vec::new(),
             bitrate_max: 0.0,
             bitrate_min: f64::MAX,

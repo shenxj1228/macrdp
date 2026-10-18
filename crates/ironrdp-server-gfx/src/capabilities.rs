@@ -20,6 +20,8 @@ pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<ca
 fn general_capabilities() -> capability_sets::General {
     capability_sets::General {
         extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED,
+        // Lets the client send Suppress Output when minimized (server stops encoding).
+        suppress_output_support: true,
         ..Default::default()
     }
 }
