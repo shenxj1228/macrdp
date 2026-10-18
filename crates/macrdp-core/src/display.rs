@@ -337,6 +337,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             } else {
                 None
             };
+            // Pipeline tail: the last submitted frame has no successor to collect it, and a
+            // static desktop yields no SCK event — wait at most one frame interval for it.
+            let idle_deadline = if self.has_pending_submit {
+                let frame_interval = Duration::from_secs(1) / self.last_applied_fps.max(1);
+                Some(idle_deadline.map_or(frame_interval, |d| d.min(frame_interval)))
+            } else {
+                idle_deadline
+            };
 
             let event = if let Some(timeout) = idle_deadline {
                 match tokio::time::timeout(timeout, self.capturer.next_frame()).await {
@@ -366,7 +374,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         continue;
                     }
                     Err(_elapsed) => {
-                        // Timeout — time to send an idle IDR keepalive
+                        // Timeout — collect the pipeline tail if any, else idle IDR keepalive
+                        // (send_idle_idr collects a pending submit first and returns it).
                         if let Some(update) = self.send_idle_idr().await? {
                             return Ok(Some(update));
                         }
@@ -607,7 +616,8 @@ impl MacDisplayUpdates {
 
     /// Collect a previously submitted async (pipelined) encode result and build a GFX DisplayUpdate.
     async fn collect_and_send_pending(&mut self, frame_width: u16, frame_height: u16) -> Result<Option<DisplayUpdate>> {
-        if !self.encoder.as_ref().is_some_and(|e| e.supports_pipelining()) {
+        // Idempotent: nothing in flight (or already collected) → nothing to do.
+        if !self.has_pending_submit || !self.encoder.as_ref().is_some_and(|e| e.supports_pipelining()) {
             return Ok(None);
         }
 
