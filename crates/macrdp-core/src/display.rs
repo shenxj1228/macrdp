@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bitrate_controller::{BitrateController, FrameStats, NetworkQuality, is_private_ip};
+use crate::cursor::CursorWatcher;
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
 
@@ -37,6 +38,9 @@ pub struct MacDisplay {
     /// Whether AVC444 mode is requested by config
     mode_444: bool,
     show_cursor: bool,
+    /// Send the cursor as RDP pointer PDUs (client-side rendering) instead of compositing it
+    /// into the captured frame.
+    cursor_pdu: bool,
     /// Explicit bitrate (config or hot-update). When set it wins over the fps/size-derived value.
     bitrate_override: Option<u32>,
     base_bitrate: u32,
@@ -58,6 +62,7 @@ impl MacDisplay {
         encoder_pref: macrdp_encode::EncoderPreference,
         mode_444: bool,
         show_cursor: bool,
+        cursor_pdu: bool,
         bitrate_override: Option<u32>,
         gfx_state: Arc<Mutex<GfxState>>,
         coord_mapper: MouseCoordMapper,
@@ -78,7 +83,7 @@ impl MacDisplay {
             width, height,
             max_width: max_w, max_height: max_h,
             fixed_resolution,
-            frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, base_bitrate, gfx_state,
+            frame_rate, quality, encoder_pref, mode_444, show_cursor, cursor_pdu, bitrate_override, base_bitrate, gfx_state,
             coord_mapper,
             shared_audio_tx,
             perf_stats,
@@ -183,7 +188,7 @@ impl RdpServerDisplay for MacDisplay {
             } else {
                 CapturePixelFormat::Bgra
             },
-            show_cursor: self.show_cursor,
+            show_cursor: self.show_cursor && !self.cursor_pdu,
         };
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
         let audio_tx = self.shared_audio_tx.as_ref()
@@ -200,8 +205,12 @@ impl RdpServerDisplay for MacDisplay {
         let initial_fps = capture_config.frame_rate;
         let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
 
+        let cursor = (self.show_cursor && self.cursor_pdu)
+            .then(|| CursorWatcher::spawn(self.coord_mapper.scale()));
+
         Ok(Box::new(MacDisplayUpdates {
             capturer,
+            cursor,
             capture_config,
             encoder,
             enc_params,
@@ -223,6 +232,7 @@ impl RdpServerDisplay for MacDisplay {
             keyframe_requested: true,
             ack_skip_streak: 0,
             last_full_uncompressed: None,
+            last_sck_retry: None,
         }))
     }
 }
@@ -253,11 +263,18 @@ enum CachedFrame {
     PixelBuffer(SafePixelBuffer, u32, u32), // buffer, width, height
 }
 
-/// IDR keepalive interval during idle scenes (seconds).
-const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(2);
+/// IDR keepalive interval during idle scenes. GFX frame ACKs already guarantee delivery;
+/// this is only a recovery backstop after a long static period, so keep it rare.
+const IDLE_IDR_INTERVAL: Duration = Duration::from_secs(10);
+/// Minimum interval between SCStream rebuild attempts while on the CoreGraphics fallback
+/// (each attempt runs SCShareableContent::get, which is expensive and fails for the whole
+/// lock-screen period).
+const SCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
+    /// Client-side cursor: pointer PDU on shape change (None = cursor is in the video frame).
+    cursor: Option<CursorWatcher>,
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
     /// Parameters the encoder was built with — used to rebuild it after a panic/cancel.
@@ -295,6 +312,8 @@ struct MacDisplayUpdates {
     ack_skip_streak: u32,
     /// When the last whole-frame uncompressed update was sent (no-AVC420 client throttle).
     last_full_uncompressed: Option<Instant>,
+    /// When SCStream was last (unsuccessfully) rebuilt on the CoreGraphics fallback path.
+    last_sck_retry: Option<Instant>,
 }
 
 /// How long to wait for the client to open and negotiate the GFX channel before falling
@@ -346,34 +365,31 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 idle_deadline
             };
 
+            // Cursor shape changes preempt frame waiting (mpsc recv on both sides is cancel-safe).
+            let (cur, cap) = (&mut self.cursor, &mut self.capturer);
+            let cursor_changed = async {
+                match cur {
+                    Some(c) => c.changed().await,
+                    None => std::future::pending().await,
+                }
+            };
             let event = if let Some(timeout) = idle_deadline {
-                match tokio::time::timeout(timeout, self.capturer.next_frame()).await {
-                    Ok(Some(e)) => e,
-                    Ok(None) => {
-                        // SCK channel closed — handle below in the fallback path
-                        // Reset idle state since we're switching capture sources
-                        self.idle_frame_count = 0;
-                        // Fall through to CG fallback
-                        tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
-                        let fallback = CgFallbackCapturer::new(&self.capture_config);
-                        loop {
-                            match ScreenCapturer::new(self.capture_config.clone(), None).await {
-                                Ok(new_capturer) => {
-                                    tracing::info!("SCStream recovered — switching back from CoreGraphics");
-                                    self.capturer = new_capturer;
-                                    break;
-                                }
-                                Err(_) => {
-                                    if let Some(cg_frame) = fallback.capture_frame() {
-                                        return self.encode_and_send(cg_frame).await;
-                                    }
-                                    tokio::time::sleep(fallback.frame_interval()).await;
-                                }
-                            }
+                let waited = tokio::select! {
+                    biased;
+                    p = cursor_changed => Err(p),
+                    r = tokio::time::timeout(timeout, cap.next_frame()) => Ok(r),
+                };
+                match waited {
+                    Err(Some(ptr)) => return Ok(Some(DisplayUpdate::RGBAPointer(ptr))),
+                    Err(None) => { self.cursor = None; continue; }
+                    Ok(Ok(Some(e))) => e,
+                    Ok(Ok(None)) => {
+                        if let Some(update) = self.cg_fallback_update().await? {
+                            return Ok(Some(update));
                         }
                         continue;
                     }
-                    Err(_elapsed) => {
+                    Ok(Err(_elapsed)) => {
                         // Timeout — collect the pipeline tail if any, else idle IDR keepalive
                         // (send_idle_idr collects a pending submit first and returns it).
                         if let Some(update) = self.send_idle_idr().await? {
@@ -384,27 +400,18 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     }
                 }
             } else {
-                match self.capturer.next_frame().await {
-                    Some(e) => e,
-                    None => {
-                        // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
-                        self.idle_frame_count = 0;
-                        tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
-                        let fallback = CgFallbackCapturer::new(&self.capture_config);
-                        loop {
-                            match ScreenCapturer::new(self.capture_config.clone(), None).await {
-                                Ok(new_capturer) => {
-                                    tracing::info!("SCStream recovered — switching back from CoreGraphics");
-                                    self.capturer = new_capturer;
-                                    break;
-                                }
-                                Err(_) => {
-                                    if let Some(cg_frame) = fallback.capture_frame() {
-                                        return self.encode_and_send(cg_frame).await;
-                                    }
-                                    tokio::time::sleep(fallback.frame_interval()).await;
-                                }
-                            }
+                let waited = tokio::select! {
+                    biased;
+                    p = cursor_changed => Err(p),
+                    r = cap.next_frame() => Ok(r),
+                };
+                match waited {
+                    Err(Some(ptr)) => return Ok(Some(DisplayUpdate::RGBAPointer(ptr))),
+                    Err(None) => { self.cursor = None; continue; }
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
+                        if let Some(update) = self.cg_fallback_update().await? {
+                            return Ok(Some(update));
                         }
                         continue;
                     }
@@ -468,6 +475,31 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// SCStream stopped (lock screen?) — serve one CoreGraphics frame, retrying the SCStream
+    /// rebuild at most every `SCK_RETRY_INTERVAL`. Returns `None` once SCK has recovered
+    /// (caller resumes the normal path), `Some(update)` for a CG frame.
+    async fn cg_fallback_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        self.idle_frame_count = 0;
+        let fallback = CgFallbackCapturer::new(&self.capture_config);
+        loop {
+            if self.last_sck_retry.is_none_or(|t| t.elapsed() >= SCK_RETRY_INTERVAL) {
+                tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
+                self.last_sck_retry = Some(Instant::now());
+                if let Ok(new_capturer) = ScreenCapturer::new(self.capture_config.clone(), None).await {
+                    tracing::info!("SCStream recovered — switching back from CoreGraphics");
+                    self.capturer = new_capturer;
+                    self.last_sck_retry = None;
+                    return Ok(None);
+                }
+            }
+            // Throttle to the configured fps on both the success and the failure path.
+            tokio::time::sleep(fallback.frame_interval()).await;
+            if let Some(cg_frame) = fallback.capture_frame() {
+                return self.encode_and_send(cg_frame).await;
+            }
+        }
+    }
+
     /// Run a blocking encoder call on the blocking pool so the single-threaded server
     /// runtime keeps handling input/ACKs. The encoder is *always* restored afterwards: on a
     /// panic inside `f` or a cancelled task it is rebuilt from `enc_params` (and the next

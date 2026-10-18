@@ -41,6 +41,12 @@ impl MouseCoordMapper {
         (mac_x, mac_y)
     }
 
+    /// RDP pixels per macOS logical point (horizontal).
+    pub fn scale(&self) -> f64 {
+        let s = self.0.lock().unwrap();
+        s.rdp_w / s.logical_w.max(1.0)
+    }
+
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
         let mut s = self.0.lock().unwrap();
         let old_w = s.rdp_w;

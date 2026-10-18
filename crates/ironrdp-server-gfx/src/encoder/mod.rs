@@ -626,3 +626,70 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
     let cmd = SurfaceCommand::SetSurfaceBits(pdu);
     Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
 }
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_core::{decode_cursor, ReadCursor};
+    use ironrdp_graphics::pointer::{DecodedPointer, PointerBitmapTarget};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdate, FastPathUpdatePdu, Fragmentation};
+    use ironrdp_pdu::pointer::PointerUpdateData;
+
+    use super::*;
+
+    /// Server `RGBAPointer` (bottom-up straight-alpha BGRA) -> fast-path NewPointer bytes ->
+    /// client-side `FastPathUpdate` parse -> `DecodedPointer`.
+    #[test]
+    fn rgba_pointer_round_trip() {
+        const W: usize = 34;
+        const H: usize = 46;
+        // Deterministic pattern: pixel (x, y_bottom_up) = [B=x, G=y, R=x^y, A=255 on even x else 0].
+        let mut data = Vec::with_capacity(W * H * 4);
+        for y in 0..H {
+            for x in 0..W {
+                let a = if x % 2 == 0 { 255 } else { 0 };
+                data.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, a]);
+            }
+        }
+        let ptr = RGBAPointer { width: W as u16, height: H as u16, hot_x: 8, hot_y: 8, data: data.clone() };
+
+        let mut frag = UpdateEncoder::rgba_pointer(ptr).unwrap();
+        let mut buf = vec![0u8; frag.size_hint()];
+        let written = frag.next(&mut buf).unwrap();
+        assert!(frag.next(&mut buf).is_none(), "34x46x4 bytes must fit a single fast-path fragment");
+
+        let mut cursor = ReadCursor::new(&buf[..written]);
+        let _header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+        let pdu: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+        assert_eq!(pdu.fragmentation, Fragmentation::Single);
+        assert_eq!(pdu.update_code, UpdateCode::NewPointer);
+
+        let FastPathUpdate::Pointer(PointerUpdateData::New(attr)) =
+            FastPathUpdate::decode_with_code(pdu.data, pdu.update_code).unwrap()
+        else {
+            panic!("expected NewPointer update");
+        };
+        assert_eq!(attr.xor_bpp, 32);
+        assert_eq!(attr.color_pointer.width, W as u16);
+        assert_eq!(attr.color_pointer.height, H as u16);
+        assert_eq!(attr.color_pointer.xor_mask, &data[..]);
+        assert!(attr.color_pointer.and_mask.is_empty());
+
+        // Accelerated target keeps straight alpha (Software squares the channels instead of
+        // multiplying by alpha, so it cannot be compared bit-exactly).
+        let dec = DecodedPointer::decode_pointer_attribute(&attr, PointerBitmapTarget::Accelerated).unwrap();
+        assert_eq!((dec.width, dec.height), (W as u16, H as u16));
+        assert_eq!((dec.hotspot_x, dec.hotspot_y), (8, 8));
+        assert_eq!(dec.bitmap_data.len(), W * H * 4);
+
+        // Decoder flips to top-down and swaps BGRA -> RGBA. Check an opaque pixel and a transparent one.
+        let decoded_px = |x: usize, y_bottom_up: usize| -> [u8; 4] {
+            let y_top_down = H - 1 - y_bottom_up;
+            let i = (y_top_down * W + x) * 4;
+            dec.bitmap_data[i..i + 4].try_into().unwrap()
+        };
+        let (x, y) = (10, 20);
+        assert_eq!(decoded_px(x, y), [(x ^ y) as u8, y as u8, x as u8, 255]);
+        let (x, y) = (33, 45);
+        assert_eq!(decoded_px(x, y), [(x ^ y) as u8, y as u8, x as u8, 0]);
+    }
+}

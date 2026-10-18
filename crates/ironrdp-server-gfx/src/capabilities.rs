@@ -1,4 +1,4 @@
-use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
+use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, LargePointer, LargePointerSupportFlags};
 
 use crate::{DesktopSize, RdpServerOptions};
 
@@ -9,6 +9,7 @@ pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<ca
         capability_sets::CapabilitySet::Order(order_capabilities()),
         capability_sets::CapabilitySet::SurfaceCommands(surface_capabilities()),
         capability_sets::CapabilitySet::Pointer(pointer_capabilities()),
+        capability_sets::CapabilitySet::LargePointer(LargePointer { flags: LargePointerSupportFlags::UP_TO_96X96_PIXELS }),
         capability_sets::CapabilitySet::Input(input_capabilities()),
         capability_sets::CapabilitySet::VirtualChannel(virtual_channel_capabilities()),
         capability_sets::CapabilitySet::MultiFragmentUpdate(multifragment_update()),

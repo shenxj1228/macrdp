@@ -3,6 +3,7 @@
 pub mod bitrate_controller;
 pub mod callbacks;
 pub mod config;
+pub mod cursor;
 pub mod display;
 pub mod handler;
 pub mod log_bridge;

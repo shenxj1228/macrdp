@@ -484,6 +484,7 @@ fn run_server_thread(args: ServerThreadArgs) {
         let fixed_resolution = (args.config.width > 0 && args.config.height > 0) || res_fixed;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
         let show_cursor = args.config.show_cursor.unwrap_or(true);
+        let cursor_pdu = show_cursor && args.config.cursor_mode.as_deref() != Some("embedded");
         let display = MacDisplay::new(
             args.width,
             args.height,
@@ -493,6 +494,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             args.encoder_pref,
             args.mode_444,
             show_cursor,
+            cursor_pdu,
             bitrate_override,
             Arc::clone(&args.gfx_state),
             args.coord_mapper,

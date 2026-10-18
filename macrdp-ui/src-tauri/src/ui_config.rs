@@ -225,6 +225,7 @@ impl UiConfig {
             chroma_mode: Some(self.chroma_mode.clone()),
             resolution: Some(self.resolution.clone()),
             show_cursor: Some(self.show_cursor),
+            cursor_mode: None,
             bitrate_mbps: Some(self.bitrate_mbps),
             audio: macrdp_core::AudioConfig::default(),
             clipboard: macrdp_core::ClipboardConfig::default(),

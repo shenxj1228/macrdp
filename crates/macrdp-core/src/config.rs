@@ -69,6 +69,13 @@ pub struct ServerConfig {
     pub resolution: Option<String>,
     /// Show cursor in capture (default: true)
     pub show_cursor: Option<bool>,
+    /// How the cursor reaches the client (default: "pointer"):
+    /// - "pointer": not composited into the captured frame; sent as RDP pointer PDUs and drawn
+    ///   locally by the client (mouse motion no longer triggers a video frame, zero cursor lag)
+    /// - "embedded": composited into the video frame by ScreenCaptureKit
+    ///
+    /// Ignored when `show_cursor = false`.
+    pub cursor_mode: Option<String>,
     /// Target bitrate in Mbps (default: auto-calculated)
     pub bitrate_mbps: Option<u32>,
     /// Audio forwarding configuration
@@ -97,6 +104,7 @@ impl Default for ServerConfig {
             chroma_mode: None,
             resolution: None,
             show_cursor: None,
+            cursor_mode: None,
             bitrate_mbps: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
