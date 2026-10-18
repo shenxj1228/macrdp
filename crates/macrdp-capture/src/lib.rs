@@ -132,13 +132,88 @@ pub struct CaptureConfig {
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
     stream: Arc<SCStream>,
-    frame_rx: mpsc::Receiver<CaptureEvent>,
+    slot: Arc<LatestSlot<CaptureEvent>>,
+}
+
+/// Single-slot "latest wins" mailbox from the SCK callback thread to the consumer. A new
+/// value replaces an unread one (the stale IOSurface is released right away), so the newest
+/// frame is never lost — unlike a full `mpsc::channel(1)`, which drops the *new* event.
+pub struct LatestSlot<T> {
+    state: std::sync::Mutex<(Option<T>, bool)>, // (item, closed)
+    notify: tokio::sync::Notify,
+}
+
+impl<T> Default for LatestSlot<T> {
+    fn default() -> Self {
+        Self { state: std::sync::Mutex::new((None, false)), notify: tokio::sync::Notify::new() }
+    }
+}
+
+impl<T> LatestSlot<T> {
+    /// Store `item`, replacing any unread one. Returns `true` if an unread item was replaced.
+    pub fn put(&self, item: T) -> bool {
+        let old = {
+            let mut st = self.state.lock().unwrap();
+            if st.1 {
+                return false;
+            }
+            st.0.replace(item)
+        };
+        self.notify.notify_one();
+        old.is_some()
+    }
+
+    /// Store `item` only if the slot is empty (an `Idle` must not hide an unread `Frame`).
+    pub fn put_if_empty(&self, item: T) {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.1 || st.0.is_some() {
+                return;
+            }
+            st.0 = Some(item);
+        }
+        self.notify.notify_one();
+    }
+
+    /// Take the item without waiting. `None` if empty or closed.
+    pub fn try_take(&self) -> Option<T> {
+        let mut st = self.state.lock().unwrap();
+        if st.1 { None } else { st.0.take() }
+    }
+
+    /// Wait for an item. `None` once closed. Cancellation safe: the item stays in the slot
+    /// until actually taken, and a `notify_one` permit survives a dropped waiter.
+    pub async fn take(&self) -> Option<T> {
+        loop {
+            {
+                let mut st = self.state.lock().unwrap();
+                if st.1 {
+                    return None;
+                }
+                if let Some(item) = st.0.take() {
+                    return Some(item);
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    /// Close: drop the pending item, `take` returns `None` from now on.
+    pub fn close(&self) {
+        let old = {
+            let mut st = self.state.lock().unwrap();
+            st.1 = true;
+            st.0.take()
+        };
+        drop(old);
+        self.notify.notify_one();
+    }
 }
 
 struct VideoOutputHandler {
-    frame_tx: mpsc::Sender<CaptureEvent>,
+    slot: Arc<LatestSlot<CaptureEvent>>,
     pixel_format: CapturePixelFormat,
-    /// Frames dropped because the channel was full (consumer slower than capture).
+    /// Unread frames replaced by a newer one (consumer slower than capture).
     dropped: std::sync::atomic::AtomicU64,
 }
 
@@ -161,13 +236,21 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         };
         let Some(event) = event else { return };
 
-        // Non-blocking send — drop frame if channel is full
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.frame_tx.try_send(event) {
+        // Never blocks the SCK callback: a Frame replaces an unread Frame (latest wins), an
+        // Idle only fills an empty slot so it cannot hide an unread Frame.
+        let replaced = match event {
+            CaptureEvent::Frame(_) => self.slot.put(event),
+            CaptureEvent::Idle => {
+                self.slot.put_if_empty(event);
+                false
+            }
+        };
+        if replaced {
             let n = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // `is_multiple_of` needs Rust 1.87; workspace MSRV is 1.75
             #[allow(clippy::manual_is_multiple_of)]
             if n % DROP_LOG_EVERY == 0 {
-                tracing::debug!(dropped = n, "Capture channel full — frames dropped");
+                tracing::debug!(dropped = n, "Capture slot overwritten — stale frames dropped");
             }
         }
     }
@@ -470,9 +553,10 @@ impl ScreenCapturer {
             .with_width(actual_width)
             .with_height(actual_height)
             .with_scales_to_fit(needs_scale)
-            // The IOSurface pool size equals queueDepth (valid range 3-8). The server holds
-            // two surfaces at once (last_frame_cache clone + VT in-flight frame), so 4 leaves
-            // two for SCK to write into; anything less starves the pool and SCK drops frames.
+            // The IOSurface pool size equals queueDepth (valid range 3-8). The server holds up
+            // to three surfaces at once (previous last_frame_cache, the frame being encoded,
+            // the newest one waiting in the slot), so 4 always leaves SCK one to write into;
+            // anything less starves the pool and SCK drops frames.
             .with_queue_depth(4)
             // Match the encoder: BT.601 matrix, sRGB primaries.
             // Values are the CFString contents of kCGDisplayStreamYCbCrMatrix_ITU_R_601_4 / kCGColorSpaceSRGB.
@@ -492,17 +576,13 @@ impl ScreenCapturer {
             .with_channel_count(AudioChannelCount::Stereo)
             .with_excludes_current_process_audio(true);
 
-        // Channel for capture events: one slot. The consumer only ever wants the newest frame
-        // (it drains with `try_next_frame` and encodes the last one), so a deeper buffer just
-        // holds stale IOSurfaces; one slot leaves the SCK pool (queueDepth 4) an extra writable
-        // surface. When full, `try_send` drops the event without blocking the SCK callback.
-        // A dropped `Idle` is harmless: it only feeds the consumer's idle counter, and SCK
-        // sends the next one on the following frame tick.
-        let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
-            mpsc::channel(1);
+        // One "latest wins" slot for capture events: the consumer only ever wants the newest
+        // frame, so a deeper buffer just holds stale IOSurfaces. SCK does not resend a frame
+        // it already delivered, so the newest one must replace the old, never be dropped.
+        let slot = Arc::new(LatestSlot::default());
 
         let video_handler = VideoOutputHandler {
-            frame_tx,
+            slot: Arc::clone(&slot),
             pixel_format: config.pixel_format,
             dropped: std::sync::atomic::AtomicU64::new(0),
         };
@@ -532,24 +612,24 @@ impl ScreenCapturer {
 
         Ok(Self {
             stream: Arc::new(stream),
-            frame_rx,
+            slot,
         })
     }
 
     /// Receive the next capture event (async, cancellation safe)
     pub async fn next_frame(&mut self) -> Option<CaptureEvent> {
-        self.frame_rx.recv().await
+        self.slot.take().await
     }
 
     /// Try to get a buffered capture event without waiting. Returns None if no event ready.
     pub fn try_next_frame(&mut self) -> Option<CaptureEvent> {
-        self.frame_rx.try_recv().ok()
+        self.slot.try_take()
     }
 
-    /// Close the frame channel: `next_frame` yields buffered events then `None`, so the
-    /// caller falls through to its SCStream-stopped path (which rebuilds the capturer).
+    /// Close the frame slot: `next_frame` returns `None` from now on, so the caller falls
+    /// through to its SCStream-stopped path (which rebuilds the capturer).
     pub fn close(&mut self) {
-        self.frame_rx.close();
+        self.slot.close();
     }
 
     /// Update capture frame rate at runtime.
@@ -741,6 +821,41 @@ mod tests {
     fn fallback_rejects_zero_size() {
         let img = solid_image(4, 4, [0; 4]);
         assert!(cg_image_to_bgra(&img, 0, 4).is_none());
+    }
+
+    #[test]
+    fn slot_latest_frame_wins() {
+        let slot = LatestSlot::<u32>::default();
+        assert!(!slot.put(1));
+        assert!(slot.put(2)); // unread 1 replaced
+        assert_eq!(slot.try_take(), Some(2));
+        assert_eq!(slot.try_take(), None);
+    }
+
+    #[test]
+    fn slot_idle_does_not_hide_frame() {
+        let slot = LatestSlot::<u32>::default();
+        slot.put(7);
+        slot.put_if_empty(0);
+        assert_eq!(slot.try_take(), Some(7));
+        slot.put_if_empty(0);
+        assert_eq!(slot.try_take(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn slot_take_waits_then_none_after_close() {
+        let slot = Arc::new(LatestSlot::<u32>::default());
+        let producer = Arc::clone(&slot);
+        let waiter = tokio::spawn(async move { slot.take().await });
+        tokio::task::yield_now().await;
+        producer.put(5);
+        assert_eq!(waiter.await.unwrap(), Some(5));
+        producer.put(6);
+        producer.close();
+        assert_eq!(producer.try_take(), None);
+        assert_eq!(producer.take().await, None);
+        assert!(!producer.put(8)); // ignored after close
+        assert_eq!(producer.take().await, None);
     }
 }
 
