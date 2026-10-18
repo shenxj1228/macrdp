@@ -240,6 +240,7 @@ impl RdpServerDisplay for MacDisplay {
             cache_unsent: false,
             encode_fail_streak: 0,
             last_set_bitrate: self.base_bitrate,
+            capture_format_dirty: false,
         }))
     }
 }
@@ -361,6 +362,9 @@ struct MacDisplayUpdates {
     encode_fail_streak: u32,
     /// Bitrate last applied to the encoder, so identical values do not hit `set_bitrate`.
     last_set_bitrate: u32,
+    /// The capture pixel format may no longer match the consumer (late GFX switch: bitmap
+    /// fallback forced BGRA, the encoder may take NV12 again). Reconciled by `encode_and_send`.
+    capture_format_dirty: bool,
 }
 
 /// How long to wait for the client to open and negotiate the GFX channel before falling
@@ -546,7 +550,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             // Drain anything already buffered and keep only the newest frame — queued
             // frames add latency, but the newest one must never be dropped.
             let mut frame = frame;
-            while let Some(macrdp_capture::CaptureEvent::Frame(newer)) = self.capturer.try_next_frame() {
+            while let Some(macrdp_capture::CaptureEvent::Frame(mut newer)) = self.capturer.try_next_frame() {
+                // The older frame is never sent, so its dirty rects must survive into the newer
+                // one (empty = whole frame, which already covers everything).
+                if frame.dirty_rects.is_empty() || newer.dirty_rects.is_empty() {
+                    newer.dirty_rects.clear();
+                } else {
+                    newer.dirty_rects.append(&mut frame.dirty_rects);
+                }
                 frame = newer;
             }
             if let Some(update) = self.encode_and_send(frame).await? {
@@ -617,50 +628,44 @@ impl MacDisplayUpdates {
             enc.force_keyframe();
         }
         self.cache_unsent = self.last_frame_cache.is_some();
+        // The bitmap fallback forced BGRA capture; a VT encoder wants NV12 zero-copy back.
+        self.capture_format_dirty = true;
     }
 
-    /// Send the cached frame the client never received (see `cache_unsent`): H.264 IDR / P
-    /// via `send_idle_idr` when the client takes AVC420, otherwise the whole frame uncompressed
-    /// (throttled; retried on the next idle event / `CACHE_FLUSH_RETRY`). `None` = not possible yet.
+    /// Send the cached frame the client never received (see `cache_unsent`) by replaying it
+    /// through `encode_and_send` (whole frame: H.264 main+aux / AVC420 / uncompressed / bitmap
+    /// fallback, exactly as a live frame would go). `None` = not possible yet; retried on the
+    /// next idle event / `CACHE_FLUSH_RETRY`.
     async fn flush_unsent_cache(&mut self) -> Result<Option<DisplayUpdate>> {
         if !self.cache_unsent || self.suppressed || self.bitmap_fallback {
             return Ok(None);
         }
-        let (ready, avc420) = {
+        let (ready, ack_backlog) = {
             let gs = self.gfx_state.lock().unwrap();
-            (gs.is_ready(), gs.avc420_supported())
+            (gs.is_ready(), gs.pending_acks > max_pending_acks(gs.rtt_ewma_ms, self.last_applied_fps))
         };
-        if !ready {
-            // GFX never negotiated and the desktop is static (SCK sends nothing more, the cursor
-            // is not captured): replay the cached frame so `encode_and_send` latches the bitmap
-            // fallback and paints it, instead of leaving the client black until something moves.
-            if self.encoder.is_none() || self.session_start.elapsed() >= GFX_NEGOTIATE_TIMEOUT {
-                if let Some(frame) = self.cached_bgra_frame() {
-                    return self.encode_and_send(frame).await;
-                }
-            }
+        // GFX still negotiating: `encode_and_send` would only re-cache the frame. After the
+        // timeout it latches the bitmap fallback (and BGRA capture) and paints the frame, so a
+        // static desktop does not stay black.
+        if !ready && self.encoder.is_some() && self.session_start.elapsed() < GFX_NEGOTIATE_TIMEOUT {
             return Ok(None);
         }
-        if avc420 && self.encoder.is_some() {
-            // AVC444: a 420 P-frame would reference the aux view — always an IDR there.
-            return self.send_idle_idr(self.keyframe_requested || self.mode_444).await;
-        }
-        let Some(frame) = self.cached_bgra_frame() else {
-            // NV12 cache on a client without H.264: `ensure_capture_format` already switched
-            // capture to BGRA, the next frame goes out whole.
-            self.cache_unsent = false;
+        // ACK backlog: `encode_and_send` would skip anyway — do not burn the skip streak on the
+        // 100 ms retry; the next ACK (or an exhausted streak) lets the flush through.
+        if ready && ack_backlog && !self.keyframe_requested && self.ack_skip_streak < MAX_ACK_SKIP_STREAK {
             return Ok(None);
-        };
-        Ok(self.try_uncompressed(&frame, true))
+        }
+        let Some(frame) = self.cached_frame() else { return Ok(None) };
+        self.encode_and_send(frame).await
     }
 
-    /// The cached frame as a whole-frame BGRA `CapturedFrame` (`None` for an NV12 cache).
-    fn cached_bgra_frame(&self) -> Option<CapturedFrame> {
-        let Some(CachedFrame::Bgra { data, width, height, stride }) = &self.last_frame_cache else { return None };
-        Some(CapturedFrame {
-            width: *width, height: *height, data: FrameData::Raw(data.clone()), stride: *stride,
-            timestamp_us: 0, dirty_rects: Vec::new(),
-        })
+    /// The cached frame as a whole-frame `CapturedFrame` (no dirty rects = everything changed).
+    fn cached_frame(&self) -> Option<CapturedFrame> {
+        let (data, width, height, stride) = match self.last_frame_cache.as_ref()? {
+            CachedFrame::Bgra { data, width, height, stride } => (FrameData::Raw(data.clone()), *width, *height, *stride),
+            CachedFrame::PixelBuffer(buf, w, h) => (FrameData::PixelBuffer(buf.clone_ref()), *w, *h, 0),
+        };
+        Some(CapturedFrame { width, height, data, stride, timestamp_us: 0, dirty_rects: Vec::new() })
     }
 
     /// `set_bitrate` only when the value changed (VT/OpenH264 property writes are not free).
@@ -723,7 +728,7 @@ impl MacDisplayUpdates {
                         if self.encode_fail_streak >= ENCODE_FAIL_REBUILD {
                             tracing::error!(streak = self.encode_fail_streak, "encoder keeps failing — rebuilding H.264 encoder");
                             self.encode_fail_streak = 0;
-                            self.rebuild_encoder().await;
+                            self.rebuild_encoder(true).await;
                         }
                     }
                 }
@@ -733,7 +738,7 @@ impl MacDisplayUpdates {
             Err(join) => anyhow::anyhow!("encoder task cancelled: {join}"),
         };
         tracing::error!("{err} — rebuilding H.264 encoder");
-        self.rebuild_encoder().await;
+        self.rebuild_encoder(false).await;
         Err(err)
     }
 
@@ -741,13 +746,26 @@ impl MacDisplayUpdates {
     /// pixel format (VT→OpenH264 fallback: NV12 `PixelBuffer` frames would be dropped forever on
     /// the synchronous path), switch `capture_config.pixel_format` and rebuild the capturer too;
     /// if that fails, close the old stream so the CG fallback loop retries with the new config.
-    async fn rebuild_encoder(&mut self) {
-        self.encoder = build_encoder(self.enc_params);
+    /// `keep_old_on_failure`: the old encoder is still usable (it only returned `Err`s) — keep
+    /// it rather than losing H.264 for the rest of the session when `create_encoder` fails.
+    async fn rebuild_encoder(&mut self, keep_old_on_failure: bool) {
+        match build_encoder(self.enc_params) {
+            None if keep_old_on_failure && self.encoder.is_some() => {
+                tracing::warn!("encoder rebuild failed — keeping the current encoder");
+                return;
+            }
+            enc => self.encoder = enc,
+        }
         self.keyframe_requested = true;
         self.last_set_bitrate = self.enc_params.bitrate;
 
-        let zero_copy = self.encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444;
+        let zero_copy = self.wants_nv12();
         self.ensure_capture_format(zero_copy).await;
+    }
+
+    /// NV12 zero-copy capture is only for an encoder that takes pixel buffers (VT) in AVC420.
+    fn wants_nv12(&self) -> bool {
+        self.encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444
     }
 
     /// Switch capture between NV12 zero-copy and BGRA (also for clients that take no H.264 at
@@ -980,7 +998,16 @@ impl MacDisplayUpdates {
         }))
     }
 
-    async fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
+    async fn encode_and_send(&mut self, mut frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
+        // A skipped frame's changes are still missing on the client: partial rects from this
+        // frame would leave them stale forever, so force a whole-frame update.
+        if self.cache_unsent {
+            frame.dirty_rects.clear();
+        }
+        if std::mem::take(&mut self.capture_format_dirty) {
+            let zero_copy = self.wants_nv12();
+            self.ensure_capture_format(zero_copy).await;
+        }
         // Client minimized (Suppress Output): keep the newest frame for the restore IDR, encode nothing.
         if self.suppressed {
             self.last_frame_cache = Some(CachedFrame::from_frame(&frame));
@@ -1007,7 +1034,7 @@ impl MacDisplayUpdates {
                 tracing::info!("Client has no AVC444 — switching this stream to AVC420 (zero-copy capture)");
                 self.mode_444 = false;
                 self.enc_params.mode_444 = false;
-                self.rebuild_encoder().await;
+                self.rebuild_encoder(false).await;
             }
         }
 
@@ -1060,7 +1087,7 @@ impl MacDisplayUpdates {
                 }
             }
             // Taken here; re-armed below if the encode produces nothing, so the IDR is not lost.
-            let force_kf = std::mem::replace(&mut self.keyframe_requested, false);
+            let mut force_kf = std::mem::replace(&mut self.keyframe_requested, false);
 
             // Synchronous encode on the blocking pool — no pipelining: a one-frame pipeline
             // costs a fixed 1/fps of latency and makes encode_ms measure the frame interval,
@@ -1125,9 +1152,10 @@ impl MacDisplayUpdates {
                                     );
                                 }
                             }
-                            // Cache frame for idle IDR re-encoding
+                            // Cache frame for idle IDR re-encoding. A dropped aux view leaves the
+                            // client's chroma stale: flush re-encodes the frame (the encoder resends aux).
                             self.last_frame_cache = Some(cache);
-                            self.cache_unsent = false;
+                            self.cache_unsent = encoded.aux_dropped;
                             if is_keyframe {
                                 self.last_idr_time = Instant::now();
                             }
@@ -1148,11 +1176,16 @@ impl MacDisplayUpdates {
                                 "AVC444 encode returned EMPTY data — frame dropped!"
                             );
                             self.keyframe_requested |= force_kf;
+                            // Last frame of a burst: nothing else will carry its content — flush it.
+                            self.last_frame_cache = Some(cache);
+                            self.cache_unsent = true;
                             return Ok(None);
                         }
                         Err(e) => {
                             macrdp_encode::warn_limited!(display_frame = self.display_frame_count, "AVC444 encode failed: {e}, falling back to AVC420");
-                            // Fall through to AVC420 path below
+                            // Fall through to AVC420 path below. The main view may already be in
+                            // the DPB without ever reaching the client — only an IDR is safe.
+                            force_kf = true;
                         }
                     }
                 }
@@ -1224,6 +1257,9 @@ impl MacDisplayUpdates {
                             "H.264 encode returned EMPTY data — frame dropped!"
                         );
                         self.keyframe_requested |= force_kf;
+                        // Last frame of a burst: nothing else will carry its content — flush it.
+                        self.last_frame_cache = Some(cache);
+                        self.cache_unsent = true;
                         return Ok(None);
                     }
                     Err(e) => {

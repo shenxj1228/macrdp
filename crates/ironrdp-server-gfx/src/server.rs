@@ -918,6 +918,9 @@ impl RdpServer {
 
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
+        // Deactivate-Reactivate re-runs this without `reset_session`: a client that no longer
+        // advertises LargePointer must drop back to 32x32.
+        self.gfx_state.lock().unwrap().max_pointer_size = 32;
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
