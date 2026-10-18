@@ -278,6 +278,9 @@ pub struct GfxState {
     /// Negotiated pointer side limit (px): 32 unless the client's LargePointer capability set
     /// (MS-RDPBCGR 2.2.7.2.7) allows more, capped at the server-advertised 96. Per-session.
     pub max_pointer_size: u32,
+    /// Signalled whenever `output_suppressed` changes so the display stream wakes up
+    /// immediately instead of waiting for the next capture event.
+    pub suppress_notify: Arc<tokio::sync::Notify>,
 }
 
 impl GfxState {
@@ -316,6 +319,7 @@ impl GfxState {
             chroma_mode: None,
             max_qp: None,
             max_pointer_size: 32,
+            suppress_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -430,6 +434,7 @@ impl GfxState {
         fresh.encoder_pref = self.encoder_pref.take();
         fresh.chroma_mode = self.chroma_mode.take();
         fresh.max_qp = self.max_qp;
+        fresh.suppress_notify = Arc::clone(&self.suppress_notify);
         *self = fresh;
     }
 

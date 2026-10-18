@@ -198,9 +198,9 @@ impl RdpServerDisplay for MacDisplay {
             .and_then(|shared| shared.lock().unwrap().clone());
         let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
 
-        let (peer_addr, max_pointer) = {
+        let (peer_addr, max_pointer, suppress_notify) = {
             let gfx = self.gfx_state.lock().unwrap();
-            (gfx.peer_addr, gfx.max_pointer_size as usize)
+            (gfx.peer_addr, gfx.max_pointer_size as usize, Arc::clone(&gfx.suppress_notify))
         };
         let network = peer_addr
             .map(|ip| NetworkQuality::from_ip(is_private_ip(ip)))
@@ -236,6 +236,7 @@ impl RdpServerDisplay for MacDisplay {
             last_sck_retry: None,
             shared_audio_tx: self.shared_audio_tx.clone(),
             suppressed: false,
+            suppress_notify,
             cache_unsent: false,
             encode_fail_streak: 0,
             last_set_bitrate: self.base_bitrate,
@@ -349,6 +350,9 @@ struct MacDisplayUpdates {
     shared_audio_tx: Option<SharedAudioTx>,
     /// Mirror of `GfxState::output_suppressed` as last seen by this stream (edge detection).
     suppressed: bool,
+    /// `GfxState::suppress_notify`: wakes the suppressed wait as soon as the client allows
+    /// output again (a static desktop may not produce any capture event to piggyback on).
+    suppress_notify: Arc<tokio::sync::Notify>,
     /// `last_frame_cache` holds a frame the client never received (skipped for overload / ACK
     /// backlog / throttle / GFX still negotiating). Flushed by `flush_unsent_cache` once the
     /// desktop is idle or the wait times out — SCK never resends an unchanged frame.
@@ -467,9 +471,13 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     }
                 }
             } else {
+                // Only this branch runs while suppressed (`idle_deadline` is None then), so the
+                // Notify wake lives here: `continue` re-runs `sync_suppressed` right away.
+                // A permit left over from the suppress edge just costs one spurious loop.
                 let waited = tokio::select! {
                     biased;
                     p = cursor_changed => Err(p),
+                    _ = self.suppress_notify.notified(), if self.suppressed => continue,
                     r = cap.next_frame() => Ok(r),
                 };
                 match waited {
