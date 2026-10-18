@@ -12,7 +12,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Protocol cap advertised via `LargePointer::UP_TO_96X96_PIXELS`.
+/// Server-side cap advertised via `LargePointer::UP_TO_96X96_PIXELS`. The per-session limit
+/// passed to [`CursorWatcher::spawn`] comes from the client's own LargePointer capset
+/// (32 when absent) and may be lower.
 pub const MAX_POINTER_PX: usize = 96;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -51,8 +53,9 @@ pub struct CursorWatcher {
 }
 
 impl CursorWatcher {
-    /// `scale` = RDP pixels per macOS logical point. The current cursor is sent immediately.
-    pub fn spawn(scale: f64) -> Self {
+    /// `scale` = RDP pixels per macOS logical point; `max_size` = largest side the client
+    /// accepts (`GfxState::max_pointer_size`). The current cursor is sent immediately.
+    pub fn spawn(scale: f64, max_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = Arc::clone(&stop);
@@ -64,7 +67,7 @@ impl CursorWatcher {
                 // hidden cursor) just skips this poll.
                 while !stop_t.load(Ordering::Relaxed) && !tx.is_closed() {
                     // AppKit autoreleases the image/rep objects; drain them every poll.
-                    let ptr = objc2::rc::autoreleasepool(|_| grab_system_cursor(scale));
+                    let ptr = objc2::rc::autoreleasepool(|_| grab_system_cursor(scale, max_size));
                     if let Some(ptr) = ptr {
                         let h = pointer_hash(&ptr, scale);
                         if h != last {
@@ -99,10 +102,18 @@ impl Drop for CursorWatcher {
     }
 }
 
+/// Shrink `w`×`h` uniformly so neither side exceeds `max_size`; returns the integer size and
+/// the applied factor (1.0 when it already fits).
+fn fit_pointer(w: f64, h: f64, max_size: usize) -> (usize, usize, f64) {
+    let max = max_size.max(1) as f64;
+    let fit = (max / w).min(max / h).min(1.0);
+    ((w * fit).round().max(1.0) as usize, (h * fit).round().max(1.0) as usize, fit)
+}
+
 /// Snapshot the current system cursor as an RDP pointer, rasterised at `scale` and clamped to
-/// `MAX_POINTER_PX` on each side (hotspot scaled alongside).
+/// `max_size` on each side (hotspot scaled alongside).
 #[allow(deprecated)]
-fn grab_system_cursor(scale: f64) -> Option<RGBAPointer> {
+fn grab_system_cursor(scale: f64, max_size: usize) -> Option<RGBAPointer> {
     use core_graphics::base::{kCGBitmapByteOrder32Little, kCGImageAlphaPremultipliedFirst};
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::{CGContext, CGInterpolationQuality};
@@ -132,12 +143,9 @@ fn grab_system_cursor(scale: f64) -> Option<RGBAPointer> {
         core_graphics::image::CGImage::from_ptr(Retained::into_raw(cg) as *mut core_graphics::sys::CGImage)
     };
 
-    // Target size in RDP pixels, shrunk uniformly if it exceeds the protocol cap.
-    let (mut w, mut h) = (want_w.round().max(1.0), (size.height * scale).round().max(1.0));
-    let fit = (MAX_POINTER_PX as f64 / w).min(MAX_POINTER_PX as f64 / h).min(1.0);
-    w = (w * fit).round().max(1.0);
-    h = (h * fit).round().max(1.0);
-    let (wi, hi) = (w as usize, h as usize);
+    // Target size in RDP pixels, shrunk uniformly if it exceeds the client's cap.
+    let (wi, hi, fit) = fit_pointer(want_w.round().max(1.0), (size.height * scale).round().max(1.0), max_size);
+    let (w, h) = (wi as f64, hi as f64);
     let stride = wi * 4;
     let mut buf = vec![0u8; stride * hi];
     {
@@ -189,10 +197,24 @@ mod tests {
         assert_eq!(&out[12..16], &[255, 255, 255, 255]);
     }
 
+    #[test]
+    fn fit_to_client_max_pointer_size() {
+        // Retina arrow (34x46) vs a client without LargePointer: must shrink to <= 32 per side.
+        let (w, h, fit) = fit_pointer(34.0, 46.0, 32);
+        assert!(w <= 32 && h <= 32, "{w}x{h}");
+        assert_eq!(h, 32);
+        assert!((fit - 32.0 / 46.0).abs() < 1e-9);
+        // The rasterised buffer feeds straight into the xor mask: tightly packed w*h*4.
+        let xor = premul_topdown_to_rdp(&vec![0u8; w * h * 4], w, h, w * 4);
+        assert_eq!(xor.len(), w * h * 4);
+        // Fits under 96: untouched.
+        assert_eq!(fit_pointer(34.0, 46.0, 96), (34, 46, 1.0));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn grab_live_cursor() {
-        match grab_system_cursor(2.0) {
+        match grab_system_cursor(2.0, MAX_POINTER_PX) {
             Some(p) => {
                 println!("cursor {}x{} hot=({},{}) bytes={}", p.width, p.height, p.hot_x, p.hot_y, p.data.len());
                 assert_eq!(p.data.len(), p.width as usize * 4 * p.height as usize);

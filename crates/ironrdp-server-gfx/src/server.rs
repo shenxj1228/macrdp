@@ -948,6 +948,10 @@ impl RdpServer {
                 CapabilitySet::SurfaceCommands(c) => {
                     surface_flags = c.flags;
                 }
+                // Without this capset the client only takes 32x32 pointers (MS-RDPBCGR 2.2.7.2.7).
+                CapabilitySet::LargePointer(lp) => {
+                    self.gfx_state.lock().unwrap().set_large_pointer(lp.flags);
+                }
                 CapabilitySet::BitmapCodecs(BitmapCodecs(codecs)) => {
                     for codec in codecs {
                         match codec.property {

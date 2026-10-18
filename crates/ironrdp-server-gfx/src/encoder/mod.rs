@@ -162,6 +162,10 @@ impl UpdateEncoder {
             width: ptr.width,
             height: ptr.height,
             xor_mask: &xor_mask,
+            // lengthAndMask = 0 is valid for xorBpp 32: the alpha channel carries the shape
+            // (MS-RDPBCGR 2.2.9.1.1.4.5; FreeRDP's pointer_new keeps andMaskData NULL when
+            // lengthAndMask == 0 and freerdp_image_copy_from_pointer_data takes the alpha-only
+            // path; mstsc does the same). ironrdp-pdu accepts an empty mask (0 % height == 0).
             and_mask: &[],
         };
         let ptr = PointerAttribute {

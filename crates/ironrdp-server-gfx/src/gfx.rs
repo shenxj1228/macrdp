@@ -14,6 +14,7 @@ use ironrdp_pdu::rdp::vc::dvc::gfx::{
     ServerPdu, StartFramePdu, Timestamp,
 };
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+use ironrdp_pdu::rdp::capability_sets::LargePointerSupportFlags;
 use ironrdp_pdu::{decode, encode_err, pdu_other_err, PduResult};
 
 type DvcMessage = ironrdp_dvc::DvcMessage;
@@ -274,6 +275,9 @@ pub struct GfxState {
     pub chroma_mode: Option<String>,
     /// Server config: H.264 per-frame QP ceiling (None = encoder default)
     pub max_qp: Option<u8>,
+    /// Negotiated pointer side limit (px): 32 unless the client's LargePointer capability set
+    /// (MS-RDPBCGR 2.2.7.2.7) allows more, capped at the server-advertised 96. Per-session.
+    pub max_pointer_size: u32,
 }
 
 impl GfxState {
@@ -311,6 +315,7 @@ impl GfxState {
             encoder_pref: None,
             chroma_mode: None,
             max_qp: None,
+            max_pointer_size: 32,
         }
     }
 
@@ -426,6 +431,14 @@ impl GfxState {
         fresh.chroma_mode = self.chroma_mode.take();
         fresh.max_qp = self.max_qp;
         *self = fresh;
+    }
+
+    /// Record the client's LargePointer capability (MS-RDPBCGR 2.2.7.2.7): absent or empty
+    /// flags = classic 32×32 limit. The negotiated size is min(client, server) and the server
+    /// only advertises `UP_TO_96X96_PIXELS` (capabilities.rs), so a 384 client still gets 96.
+    pub fn set_large_pointer(&mut self, flags: LargePointerSupportFlags) {
+        let large = LargePointerSupportFlags::UP_TO_96X96_PIXELS | LargePointerSupportFlags::UP_TO_384X384_PIXELS;
+        self.max_pointer_size = if flags.intersects(large) { 96 } else { 32 };
     }
 }
 
@@ -1169,6 +1182,25 @@ mod tests {
         assert_eq!(unwrap_zgfx(&wrap_zgfx(b"hello")).unwrap(), b"hello");
         let big = vec![7u8; 150_000];
         assert_eq!(unwrap_zgfx(&wrap_zgfx(&big)).unwrap(), big);
+    }
+
+    #[test]
+    fn large_pointer_capability_sets_max_pointer_size() {
+        let mut s = GfxState::new(800, 600, false);
+        assert_eq!(s.max_pointer_size, 32, "no LargePointer capset = 32x32");
+        // Same shape as server.rs: the client's `CapabilitySet::LargePointer(lp)` → `lp.flags`.
+        let caps = |flags| ironrdp_pdu::rdp::capability_sets::LargePointer { flags }.flags;
+        s.set_large_pointer(caps(LargePointerSupportFlags::UP_TO_96X96_PIXELS));
+        assert_eq!(s.max_pointer_size, 96);
+        s.set_large_pointer(caps(LargePointerSupportFlags::UP_TO_96X96_PIXELS | LargePointerSupportFlags::UP_TO_384X384_PIXELS));
+        assert_eq!(s.max_pointer_size, 96, "server advertises 96 only: never exceed what we declared");
+        s.set_large_pointer(caps(LargePointerSupportFlags::UP_TO_384X384_PIXELS));
+        assert_eq!(s.max_pointer_size, 96);
+        s.set_large_pointer(caps(LargePointerSupportFlags::empty()));
+        assert_eq!(s.max_pointer_size, 32);
+        s.max_pointer_size = 96;
+        s.reset_session();
+        assert_eq!(s.max_pointer_size, 32, "per-session: a new client re-advertises");
     }
 
     #[test]

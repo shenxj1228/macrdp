@@ -198,9 +198,9 @@ impl RdpServerDisplay for MacDisplay {
             .and_then(|shared| shared.lock().unwrap().clone());
         let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
 
-        let peer_addr = {
+        let (peer_addr, max_pointer) = {
             let gfx = self.gfx_state.lock().unwrap();
-            gfx.peer_addr
+            (gfx.peer_addr, gfx.max_pointer_size as usize)
         };
         let network = peer_addr
             .map(|ip| NetworkQuality::from_ip(is_private_ip(ip)))
@@ -209,7 +209,7 @@ impl RdpServerDisplay for MacDisplay {
         let bitrate_ctrl = BitrateController::new(self.base_bitrate, initial_fps, network);
 
         let cursor = (self.show_cursor && self.cursor_pdu)
-            .then(|| CursorWatcher::spawn(self.coord_mapper.scale()));
+            .then(|| CursorWatcher::spawn(self.coord_mapper.scale(), max_pointer));
 
         Ok(Box::new(MacDisplayUpdates {
             capturer,
