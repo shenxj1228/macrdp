@@ -179,7 +179,7 @@ pub enum EncoderPreference {
     Software,
     /// VideoToolbox GPU encoder — low latency (~6ms), supports P-frames
     Hardware,
-    /// Same as Software (recommended default)
+    /// VideoToolbox when available, otherwise OpenH264 (recommended default)
     Auto,
 }
 
@@ -201,12 +201,17 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
     tracing::info!(width, height, enc_w, enc_h, fps, ?quality, ?preference, mode_444,
         bitrate_mbps = bitrate as f64 / 1_000_000.0, "Creating H.264 encoder");
 
-    // Hardware: VideoToolbox GPU encoder
+    // Auto / Hardware: VideoToolbox GPU encoder. The session takes the *visible* (even) size —
+    // VT does macroblock alignment and SPS cropping itself. A 16-aligned session instead makes VT
+    // *scale* every zero-copy capture buffer up to it (1080→1088 measured by
+    // `vt_zero_copy_1080_pixel_buffer_decodes_to_visible_size`), which the client then crops.
+    // AVC444 keeps align16: the YUV444 split fills planes sized to the encoder.
     #[cfg(target_os = "macos")]
-    if preference == EncoderPreference::Hardware {
-        match VtEncoder::new(enc_w, enc_h, fps, bitrate, mode_444) {
+    if preference != EncoderPreference::Software {
+        let (vt_w, vt_h) = if mode_444 { (enc_w, enc_h) } else { ((width + 1) & !1, (height + 1) & !1) };
+        match VtEncoder::new(vt_w, vt_h, fps, bitrate, mode_444) {
             Ok(encoder) => {
-                tracing::info!(enc_w, enc_h, mode_444, "Using VideoToolbox hardware encoder (GPU)");
+                tracing::info!(vt_w, vt_h, mode_444, "Using VideoToolbox hardware encoder (GPU)");
                 return Ok(Box::new(encoder));
             }
             Err(e) => {
@@ -215,7 +220,7 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
         }
     }
 
-    // Software / Auto: OpenH264 CPU encoder (full P-frame support)
+    // Software, or VT fallback: OpenH264 CPU encoder (full P-frame support)
     tracing::info!(enc_w, enc_h, mode_444, "Using OpenH264 software encoder (CPU)");
     let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444)?;
     Ok(Box::new(encoder))

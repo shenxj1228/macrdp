@@ -60,7 +60,7 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     /// Video quality: low_latency, balanced, high_quality (default: high_quality)
     pub quality: Option<String>,
-    /// H.264 encoder: software, hardware, auto (default: software)
+    /// H.264 encoder: software, hardware, auto (default: auto = VideoToolbox hardware, falls back to OpenH264)
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     pub chroma_mode: Option<String>,

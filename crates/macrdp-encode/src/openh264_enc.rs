@@ -66,6 +66,8 @@ fn create_oh264_encoder(fps: f32, bitrate: u32) -> Result<Encoder> {
         .adaptive_quantization(false)
         .qp(openh264::encoder::QpRange::new(10, 36))
         .skip_frames(false)
+        // Window switches must not force an IDR (bitrate spike); GOP/force_keyframe handle refresh.
+        .scene_change_detect(false)
         .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
         .complexity(openh264::encoder::Complexity::Medium)
         .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps as u32 * 10))
