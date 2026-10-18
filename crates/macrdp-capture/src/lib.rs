@@ -492,9 +492,14 @@ impl ScreenCapturer {
             .with_channel_count(AudioChannelCount::Stereo)
             .with_excludes_current_process_audio(true);
 
-        // Channel for capture events: buffer 2 entries to allow for jitter
+        // Channel for capture events: one slot. The consumer only ever wants the newest frame
+        // (it drains with `try_next_frame` and encodes the last one), so a deeper buffer just
+        // holds stale IOSurfaces; one slot leaves the SCK pool (queueDepth 4) an extra writable
+        // surface. When full, `try_send` drops the event without blocking the SCK callback.
+        // A dropped `Idle` is harmless: it only feeds the consumer's idle counter, and SCK
+        // sends the next one on the following frame tick.
         let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
-            mpsc::channel(2);
+            mpsc::channel(1);
 
         let video_handler = VideoOutputHandler {
             frame_tx,
