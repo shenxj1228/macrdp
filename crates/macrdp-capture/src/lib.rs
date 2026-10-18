@@ -541,6 +541,12 @@ impl ScreenCapturer {
         self.frame_rx.try_recv().ok()
     }
 
+    /// Close the frame channel: `next_frame` yields buffered events then `None`, so the
+    /// caller falls through to its SCStream-stopped path (which rebuilds the capturer).
+    pub fn close(&mut self) {
+        self.frame_rx.close();
+    }
+
     /// Update capture frame rate at runtime.
     /// Note: SCStream::update_configuration() blocks (unbounded condvar wait) until SCK
     /// invokes the completion handler. Prefer [`Self::set_frame_rate_async`] from tokio tasks.

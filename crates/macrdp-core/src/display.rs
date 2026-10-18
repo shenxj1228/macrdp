@@ -523,11 +523,42 @@ impl MacDisplayUpdates {
             Err(join) => anyhow::anyhow!("encoder task cancelled: {join}"),
         };
         tracing::error!("{err} — rebuilding H.264 encoder");
+        self.rebuild_encoder().await;
+        Err(err)
+    }
+
+    /// Rebuild the encoder from `enc_params`. If the rebuilt encoder accepts a different capture
+    /// pixel format (VT→OpenH264 fallback: NV12 `PixelBuffer` frames would be dropped forever on
+    /// the synchronous path), switch `capture_config.pixel_format` and rebuild the capturer too;
+    /// if that fails, close the old stream so the CG fallback loop retries with the new config.
+    async fn rebuild_encoder(&mut self) {
         self.encoder = self.enc_params.create();
         self.keyframe_requested = true;
         self.has_pending_submit = false;
         self.pending_frame_time = None;
-        Err(err)
+
+        let zero_copy = self.encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444;
+        let want = if zero_copy {
+            CapturePixelFormat::nv12(macrdp_encode::LIMITED_RANGE)
+        } else {
+            CapturePixelFormat::Bgra
+        };
+        if want == self.capture_config.pixel_format {
+            return;
+        }
+        tracing::warn!(
+            from = ?self.capture_config.pixel_format, to = ?want,
+            "rebuilt encoder needs a different capture pixel format — rebuilding capturer"
+        );
+        self.capture_config.pixel_format = want;
+        self.last_frame_cache = None;
+        match ScreenCapturer::new(self.capture_config.clone(), None).await {
+            Ok(c) => self.capturer = c,
+            Err(e) => {
+                tracing::error!("capturer rebuild failed ({e:#}) — closing stream, CG fallback will retry");
+                self.capturer.close();
+            }
+        }
     }
 
     /// Size of the cached last frame (also the size of any pending pipelined submit).
