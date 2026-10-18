@@ -213,7 +213,11 @@ extern "C" fn encode_callback(
 
     if status != 0 || sample_buffer.is_null() {
         // Signal has_data so encoder doesn't timeout waiting — it will get empty data
-        warn_limited!(status, null_buf = sample_buffer.is_null(), "VT encode callback error");
+        if status != 0 {
+            warn_limited!(status, "VT encode callback error");
+        } else {
+            warn_limited!("VT dropped frame (encoder over budget: QP cap vs data-rate limit, or session overloaded)");
+        }
         ctx.has_data.store(true, std::sync::atomic::Ordering::Release);
         ctx.ready.notify_one();
         return;
