@@ -1230,6 +1230,7 @@ impl VideoEncoder for VtEncoder {
         drop(main_pb);
         self.frame_count += 1;
         let mut dropped = main_nal.is_empty();
+        let mut aux_dropped = false;
 
         // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs).
         // Skipped when the aux planes are byte-identical to the last aux the client got
@@ -1251,7 +1252,8 @@ impl VideoEncoder for VtEncoder {
             // Empty NAL = VT dropped main or aux: the frame never reaches the client.
             bufs.prev_aux_valid = !aux_nal.is_empty() && !main_nal.is_empty();
             std::mem::swap(&mut bufs.aux_view, &mut bufs.prev_aux);
-            dropped |= aux_nal.is_empty();
+            aux_dropped = aux_nal.is_empty();
+            dropped |= aux_dropped;
             // Dropped aux goes out as LC=LUMA (`None`), never as an empty aux stream.
             (!aux_nal.is_empty()).then(|| EncodedFrame {
                 data: Bytes::from(aux_nal),
@@ -1262,12 +1264,18 @@ impl VideoEncoder for VtEncoder {
             None
         };
         drop(frame_props);
+        // Main dropped but aux encoded: the aux is in the DPB yet never reaches the client,
+        // so later P frames would reference it. Next encode starts a fresh IDR.
+        if main_nal.is_empty() && aux_view.is_some() {
+            self.pending_force_keyframe = true;
+        }
         self.adapt_rate_limits(dropped);
 
         tracing::debug!(
             frame = self.frame_count,
             main_bytes = main_nal.len(),
             aux_bytes = aux_view.as_ref().map_or(0, |a| a.data.len()),
+            aux_dropped,
             aux_skipped = aux_view.is_none(),
             "AVC444 dual-stream encode"
         );
@@ -1279,6 +1287,7 @@ impl VideoEncoder for VtEncoder {
                 width: w, height: h,
             },
             aux_view,
+            aux_dropped,
         })
     }
 

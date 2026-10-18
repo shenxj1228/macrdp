@@ -32,6 +32,10 @@ pub struct Avc444EncodedFrame {
     /// `None` = aux planes identical to the last sent aux view: send LC=LUMA only, the client
     /// keeps its previous chroma. Always `Some` on a keyframe.
     pub aux_view: Option<EncodedFrame>,
+    /// `aux_view == None` because the encoder dropped the aux frame (rate limiter), not
+    /// because it was unchanged: the client's chroma is now stale until the next full
+    /// aux/keyframe. Never true together with `Some(aux_view)`.
+    pub aux_dropped: bool,
 }
 
 /// Quality preset

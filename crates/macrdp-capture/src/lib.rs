@@ -133,6 +133,50 @@ pub struct CaptureConfig {
 pub struct ScreenCapturer {
     stream: Arc<SCStream>,
     slot: Arc<LatestSlot<CaptureEvent>>,
+    /// The full stream configuration: SCK's updateConfiguration replaces the whole object,
+    /// so a frame-rate change must resend size/pixel format/cursor/queue depth too.
+    config: SCStreamConfiguration,
+}
+
+/// Run a blocking SCK call (whose crate wrapper waits unbounded on the completion callback)
+/// on a helper thread and give up after `timeout`. The helper thread keeps waiting and exits
+/// when SCK finally calls back; only the caller is unblocked. If the call succeeds after the
+/// caller gave up, `undo_late` runs on the helper thread (e.g. stop a stream nobody owns).
+/// At most `MAX_SCK_IN_FLIGHT` helpers may be alive: a dead SCK must not grow a thread per
+/// retry (the CG fallback rebuilds the capturer every second).
+fn sck_call_timeout<T: Send + 'static>(
+    what: &'static str,
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> Result<T, screencapturekit::prelude::SCError> + Send + 'static,
+    undo_late: impl FnOnce() + Send + 'static,
+) -> Result<T> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    const MAX_SCK_IN_FLIGHT: usize = 4;
+    if IN_FLIGHT.load(Ordering::Relaxed) >= MAX_SCK_IN_FLIGHT {
+        anyhow::bail!("SCStream {what}: {MAX_SCK_IN_FLIGHT} earlier SCK calls still hung — not issuing another");
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name(format!("sck-{what}"))
+        .spawn(move || {
+            let r = f();
+            IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+            if let Err(std::sync::mpsc::SendError(Ok(_))) = tx.send(r) {
+                tracing::warn!("SCStream {what} completed after the caller gave up");
+                undo_late();
+            }
+        });
+    if let Err(e) = spawned {
+        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        return Err(e).context("spawn SCK helper thread");
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow::anyhow!("SCStream {what} failed: {e:?}")),
+        Err(_) => Err(anyhow::anyhow!("SCStream {what} timed out after {timeout:?}")),
+    }
 }
 
 /// Single-slot "latest wins" mailbox from the SCK callback thread to the consumer. A new
@@ -152,10 +196,20 @@ impl<T> Default for LatestSlot<T> {
 impl<T> LatestSlot<T> {
     /// Store `item`, replacing any unread one. Returns `true` if an unread item was replaced.
     pub fn put(&self, item: T) -> bool {
+        self.put_with(item, |_, _| {})
+    }
+
+    /// Like [`Self::put`], but when an unread item is replaced, `merge(&old, &mut new)` runs
+    /// under the slot lock first so `new` can absorb what the consumer never saw. The old
+    /// item is dropped after the lock is released.
+    pub fn put_with(&self, mut item: T, merge: impl FnOnce(&T, &mut T)) -> bool {
         let old = {
             let mut st = self.state.lock().unwrap();
             if st.1 {
                 return false;
+            }
+            if let Some(old) = &st.0 {
+                merge(old, &mut item);
             }
             st.0.replace(item)
         };
@@ -237,9 +291,20 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         let Some(event) = event else { return };
 
         // Never blocks the SCK callback: a Frame replaces an unread Frame (latest wins), an
-        // Idle only fills an empty slot so it cannot hide an unread Frame.
+        // Idle only fills an empty slot so it cannot hide an unread Frame. The replaced
+        // Frame's dirty rects are folded into the new one so the consumer still refreshes
+        // the regions that only changed in the frame it never saw.
         let replaced = match event {
-            CaptureEvent::Frame(_) => self.slot.put(event),
+            CaptureEvent::Frame(_) => self.slot.put_with(event, |old, new| {
+                if let (CaptureEvent::Frame(old), CaptureEvent::Frame(new)) = (old, new) {
+                    // Empty = whole frame; stays empty if either side was
+                    if old.dirty_rects.is_empty() || new.dirty_rects.is_empty() {
+                        new.dirty_rects.clear();
+                    } else {
+                        new.dirty_rects.extend(old.dirty_rects.iter().cloned());
+                    }
+                }
+            }),
             CaptureEvent::Idle => {
                 self.slot.put_if_empty(event);
                 false
@@ -598,7 +663,13 @@ impl ScreenCapturer {
             stream.add_output_handler(audio_handler, SCStreamOutputType::Audio);
         }
 
-        stream.start_capture().context("Failed to start capture")?;
+        let stream = Arc::new(stream);
+        {
+            let (s, late) = (Arc::clone(&stream), Arc::clone(&stream));
+            // Started after we gave up: nobody owns it, stop it instead of leaving it rendering.
+            sck_call_timeout("startCapture", std::time::Duration::from_secs(5), move || s.start_capture(), move || { let _ = late.stop_capture(); })
+                .context("Failed to start capture")?;
+        }
 
         tracing::info!(
             width = actual_width,
@@ -610,10 +681,7 @@ impl ScreenCapturer {
             "Screen capture started"
         );
 
-        Ok(Self {
-            stream: Arc::new(stream),
-            slot,
-        })
+        Ok(Self { stream, slot, config: stream_config })
     }
 
     /// Receive the next capture event (async, cancellation safe)
@@ -632,28 +700,40 @@ impl ScreenCapturer {
         self.slot.close();
     }
 
-    /// Update capture frame rate at runtime.
-    /// Note: SCStream::update_configuration() blocks (unbounded condvar wait) until SCK
-    /// invokes the completion handler. Prefer [`Self::set_frame_rate_async`] from tokio tasks.
+    /// Update capture frame rate at runtime. Blocks until SCK confirms the new
+    /// configuration, at most 2 s. Prefer [`Self::set_frame_rate_async`] from tokio tasks.
     pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
-        apply_frame_rate(&self.stream, fps)
+        apply_frame_rate(Arc::clone(&self.stream), self.config.clone(), fps)
     }
 
     /// Same as [`Self::set_frame_rate`] but runs the blocking SCK call on
     /// `spawn_blocking`, so it never stalls a tokio worker thread.
     pub async fn set_frame_rate_async(&self, fps: u32) -> anyhow::Result<()> {
         let stream = Arc::clone(&self.stream);
-        tokio::task::spawn_blocking(move || apply_frame_rate(&stream, fps)).await?
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || apply_frame_rate(stream, config, fps)).await?
     }
 }
 
-fn apply_frame_rate(stream: &SCStream, fps: u32) -> anyhow::Result<()> {
+impl Drop for ScreenCapturer {
+    /// Stop the SCStream so a replaced capturer does not keep rendering into its IOSurface
+    /// pool. `close()` only closes the slot, so this is the single stop call.
+    fn drop(&mut self) {
+        self.slot.close();
+        let stream = Arc::clone(&self.stream);
+        if let Err(e) = sck_call_timeout("stopCapture", std::time::Duration::from_secs(2), move || stream.stop_capture(), || {}) {
+            tracing::warn!(error = %e, "Screen capture stop");
+        }
+    }
+}
+
+/// `config` is a retained reference to the capturer's own configuration object (SCK clones
+/// on retain, not copy), so only the interval changes and every other field stays as built.
+fn apply_frame_rate(stream: Arc<SCStream>, mut config: SCStreamConfiguration, fps: u32) -> anyhow::Result<()> {
     let interval = CMTime::new(1, fps as i32);
-    let mut config = SCStreamConfiguration::new();
     config.set_minimum_frame_interval(&interval);
-    stream
-        .update_configuration(&config)
-        .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
+    sck_call_timeout("updateConfiguration", std::time::Duration::from_secs(2), move || stream.update_configuration(&config), || {})
+        .context("Failed to update SCStream frame rate")?;
     tracing::info!(fps, "Capture frame rate updated");
     Ok(())
 }
@@ -842,6 +922,16 @@ mod tests {
         assert_eq!(slot.try_take(), Some(0));
     }
 
+    #[test]
+    fn slot_put_with_merges_replaced_item() {
+        let slot = LatestSlot::<Vec<u32>>::default();
+        assert!(!slot.put_with(vec![1], |_, _| unreachable!()));
+        assert!(slot.put_with(vec![2], |old, new| new.extend(old)));
+        assert_eq!(slot.try_take(), Some(vec![2, 1]));
+        assert!(!slot.put_with(vec![3], |_, _| unreachable!())); // slot was empty
+        assert_eq!(slot.try_take(), Some(vec![3]));
+    }
+
     #[tokio::test]
     async fn slot_take_waits_then_none_after_close() {
         let slot = Arc::new(LatestSlot::<u32>::default());
@@ -856,6 +946,55 @@ mod tests {
         assert_eq!(producer.take().await, None);
         assert!(!producer.put(8)); // ignored after close
         assert_eq!(producer.take().await, None);
+    }
+
+    extern "C" {
+        fn CVPixelBufferGetPixelFormatType(pixel_buffer: *mut c_void) -> u32;
+    }
+
+    /// Next real `Frame` (skipping `Idle`) as (pixel format fourcc, width, height).
+    async fn next_pixel_frame(cap: &mut ScreenCapturer) -> (u32, u32, u32) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, cap.next_frame()).await
+                .expect("no frame within 10s").expect("capturer closed");
+            if let CaptureEvent::Frame(f) = ev {
+                let fmt = match &f.data {
+                    FrameData::PixelBuffer(pb) => unsafe { CVPixelBufferGetPixelFormatType(pb.as_ptr()) },
+                    FrameData::Raw(_) => 0,
+                };
+                return (fmt, f.width, f.height);
+            }
+        }
+    }
+
+    /// Needs Screen Recording permission (skips otherwise). Verifies a frame-rate change
+    /// keeps the NV12 pixel format and size. SCStream holds exactly one configuration object
+    /// and updateConfiguration replaces it, so a fresh `SCStreamConfiguration::new()` with
+    /// only the interval set would reset width/height/pixelFormat(BGRA)/showsCursor/
+    /// queueDepth to their defaults; the capturer therefore resends its own full config.
+    #[tokio::test]
+    async fn frame_rate_update_keeps_stream_config() {
+        let mut cap = match ScreenCapturer::new(
+            CaptureConfig { width: 0, height: 0, frame_rate: 30, pixel_format: CapturePixelFormat::Nv12Full, show_cursor: false },
+            None,
+        ).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipped: cannot start capture (Screen Recording permission?): {e:#}");
+                return;
+            }
+        };
+        let before = next_pixel_frame(&mut cap).await;
+        assert_eq!(before.0, u32::from_be_bytes(*b"420f"), "initial frame is not NV12 420f");
+        cap.set_frame_rate_async(5).await.unwrap();
+        // A config change makes SCK emit a fresh frame; the first one may still be from the
+        // old config, so look at a couple of frames.
+        let mut after = next_pixel_frame(&mut cap).await;
+        for _ in 0..2 {
+            after = next_pixel_frame(&mut cap).await;
+        }
+        assert_eq!(after, before, "frame rate update changed pixel format or size");
     }
 }
 

@@ -297,6 +297,7 @@ impl VideoEncoder for OpenH264Encoder {
                 width: w,
                 height: h,
             }),
+            aux_dropped: false,
         })
     }
 
