@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # ScreenCaptureKit + swift build need full Xcode; macOS runners ship with it.
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            macrdp-ui/src-tauri
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          swift --version
+          cargo --version
+
+      - name: Test Rust workspace
+        run: cargo test --workspace
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: macrdp-ui/package-lock.json
+
+      - name: Build frontend
+        run: cd macrdp-ui && npm ci && npm run build
+
+      - name: Build Tauri app (no bundle)
+        run: cd macrdp-ui && npm run tauri -- build --no-bundle

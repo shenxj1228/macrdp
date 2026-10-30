@@ -11,25 +11,22 @@ permissions:
 jobs:
   build-macos:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - runner: macos-latest
-            target: aarch64-apple-darwin
+          - runner: macos-15
             arch: aarch64
           - runner: macos-15-intel
-            target: x86_64-apple-darwin
             arch: x86_64
 
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-action/setup@v1
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -38,10 +35,15 @@ jobs:
             .
             macrdp-ui/src-tauri
 
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          swift --version
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: macrdp-ui/package-lock.json
 
@@ -51,22 +53,23 @@ jobs:
       - name: Build CLI (release)
         run: cargo build -p macrdp-server --release
 
+      # tauri.conf.json signs ad-hoc (signingIdentity: "-"), no cert needed in CI.
       - name: Build UI + DMG
         run: cd macrdp-ui && npm run tauri -- build
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ""
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
           name: macrdp-${{ matrix.arch }}
           path: macrdp-ui/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
 
       - name: Upload CLI binary
         uses: actions/upload-artifact@v4
         with:
           name: macrdp-server-${{ matrix.arch }}
           path: target/release/macrdp-server
+          if-no-files-found: error
 
   release:
     needs: build-macos
