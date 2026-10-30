@@ -16,8 +16,6 @@ jobs:
         include:
           - runner: macos-15
             arch: aarch64
-          - runner: macos-15-intel
-            arch: x86_64
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -89,6 +87,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/macrdp-aarch64/*.dmg
-            artifacts/macrdp-x86_64/*.dmg
             artifacts/macrdp-server-aarch64/macrdp-server
-            artifacts/macrdp-server-x86_64/macrdp-server
