@@ -198,6 +198,12 @@ fn find_available_port(addr: &str, preferred_port: u16) -> Result<(TcpListener, 
                 tracing::debug!(port, "Port in use, trying next");
                 continue;
             }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 => {
+                anyhow::bail!(
+                    "Cannot bind {bind_addr}: ports below 1024 require root. \
+                     Use a port >= 1024 (e.g. 13389) or run macrdp with sudo"
+                );
+            }
             Err(e) => {
                 return Err(e).context(format!("Failed to bind to {bind_addr}"));
             }
@@ -227,7 +233,25 @@ pub async fn start_server_with_perf(
     perf_stats: Option<SharedPerfStats>,
 ) -> Result<Arc<ServerHandle>> {
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
+    let result = start_server_inner(config, Arc::clone(&handler), perf_stats).await;
+    if let Err(ref e) = result {
+        // Any failure before the server thread owns status reporting (permissions, TLS,
+        // bind, ...) must still leave "starting", otherwise the UI spins forever.
+        tracing::error!("Failed to start RDP server: {e:#}");
+        handler.on_status_change(ServerStatus {
+            running: false,
+            state: "error".to_string(),
+            uptime_secs: 0,
+        });
+    }
+    result
+}
 
+async fn start_server_inner(
+    config: ServerConfig,
+    handler: Arc<dyn ServerEventHandler>,
+    perf_stats: Option<SharedPerfStats>,
+) -> Result<Arc<ServerHandle>> {
     // Notify handler: starting
     handler.on_status_change(ServerStatus {
         running: true,
@@ -427,7 +451,8 @@ fn run_server_thread(args: ServerThreadArgs) {
                 tracing::error!("Failed to load TLS certificate: {e}");
                 args.handler.on_status_change(ServerStatus {
                     running: false,
-                    state: format!("error: {e}"),
+                    // Plain "error": the UI maps state names directly; details go to the log.
+                    state: "error".to_string(),
                     uptime_secs: 0,
                 });
                 return;
@@ -439,7 +464,8 @@ fn run_server_thread(args: ServerThreadArgs) {
                 tracing::error!("Failed to create TLS acceptor: {e}");
                 args.handler.on_status_change(ServerStatus {
                     running: false,
-                    state: format!("error: {e}"),
+                    // Plain "error": the UI maps state names directly; details go to the log.
+                    state: "error".to_string(),
                     uptime_secs: 0,
                 });
                 return;
@@ -610,7 +636,8 @@ fn run_server_thread(args: ServerThreadArgs) {
                     tracing::error!("RDP server error: {e}");
                     args.handler.on_status_change(ServerStatus {
                         running: false,
-                        state: format!("error: {e}"),
+                        // Plain "error": the UI maps state names directly; details go to the log.
+                        state: "error".to_string(),
                         uptime_secs: 0,
                     });
                 }
