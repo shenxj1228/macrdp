@@ -1009,6 +1009,8 @@ mod tests {
 
     extern "C" {
         fn CVPixelBufferGetPixelFormatType(pixel_buffer: *mut c_void) -> u32;
+        /// TCC query only — safe without a GUI session, unlike SCShareableContent::get().
+        fn CGPreflightScreenCaptureAccess() -> bool;
     }
 
     /// Next real `Frame` (skipping `Idle`) as (pixel format fourcc, width, height).
@@ -1035,8 +1037,10 @@ mod tests {
     #[tokio::test]
     async fn frame_rate_update_keeps_stream_config() {
         // Only a missing TCC grant is a legitimate skip; any `new()` failure past that is a bug.
-        if let Err(e) = SCShareableContent::get() {
-            eprintln!("skipped: no Screen Recording permission: {e:?}");
+        // Preflight the TCC grant instead of calling SCShareableContent::get(): on a headless
+        // box (CI runner, no GUI session) the SCK call crashes the process instead of erroring.
+        if !unsafe { CGPreflightScreenCaptureAccess() } {
+            eprintln!("skipped: no Screen Recording permission (TCC not granted)");
             return;
         }
         let mut cap = ScreenCapturer::new(
