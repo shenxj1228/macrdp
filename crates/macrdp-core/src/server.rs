@@ -259,34 +259,47 @@ async fn start_server_inner(
         uptime_secs: 0,
     });
 
-    // Check and request permissions
-    let perms = permissions::request_permissions();
+    // Check permissions only — the UI already prompts on startup. Requesting here can
+    // block the caller (and the UI's "starting" state) on a system dialog.
+    let perms = permissions::check_permissions();
     tracing::info!(?perms, "Permission status");
+    if !perms.screen_capture {
+        tracing::warn!(
+            "Screen Recording permission not granted — grant it in System Settings > \
+             Privacy & Security > Screen Recording, then restart macrdp"
+        );
+    }
 
     // TLS
     let (cert_path, key_path) =
         tls::ensure_tls_files(config.cert_path.as_deref(), config.key_path.as_deref())?;
 
-    // Display detection — SCK for capture sizing, CG for mouse mapping
-    let (sck_w, sck_h) = match permissions::detect_display_size() {
-        Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "SCK logical display size");
-            (w as u16, h as u16)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
-            (1920u16, 1080u16)
-        }
-    };
+    // Display detection — CGDisplay is permission-free. Only query SCK when Screen
+    // Recording is granted: SCShareableContent::get() can block indefinitely while the
+    // TCC grant is missing, which would leave the server stuck in "starting".
     let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
         Ok((w, h)) => {
             tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
             (w as u16, h as u16)
         }
         Err(e) => {
-            tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
-            (sck_w, sck_h)
+            tracing::warn!("Failed to detect CG display size: {e}, defaulting to 1920x1080");
+            (1920u16, 1080u16)
         }
+    };
+    let (sck_w, sck_h) = if perms.screen_capture {
+        match permissions::detect_display_size() {
+            Ok((w, h)) => {
+                tracing::info!(width = w, height = h, "SCK logical display size");
+                (w as u16, h as u16)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to detect SCK display size: {e}, using CG size");
+                (cg_w, cg_h)
+            }
+        }
+    } else {
+        (cg_w, cg_h)
     };
     if sck_w != cg_w || sck_h != cg_h {
         tracing::warn!(sck_w, sck_h, cg_w, cg_h, "SCK and CG display sizes differ!");
