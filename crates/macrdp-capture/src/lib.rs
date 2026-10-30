@@ -1029,12 +1029,18 @@ mod tests {
         }
     }
 
-    /// Needs Screen Recording permission (skips otherwise). Verifies a frame-rate change
-    /// keeps the NV12 pixel format and size. SCStream holds exactly one configuration object
-    /// and updateConfiguration replaces it, so a fresh `SCStreamConfiguration::new()` with
-    /// only the interval set would reset width/height/pixelFormat(BGRA)/showsCursor/
-    /// queueDepth to their defaults; the capturer therefore resends its own full config.
+    /// Needs Screen Recording permission and a real display session (skips otherwise).
+    /// Verifies a frame-rate change keeps the NV12 pixel format and size. SCStream holds
+    /// exactly one configuration object and updateConfiguration replaces it, so a fresh
+    /// `SCStreamConfiguration::new()` with only the interval set would reset width/height/
+    /// pixelFormat(BGRA)/showsCursor/queueDepth to their defaults; the capturer therefore
+    /// resends its own full config.
+    ///
+    /// Ignored by default: on a headless CI runner (no GUI session) SCK segfaults instead of
+    /// erroring, taking the whole test binary down. Run locally with
+    /// `cargo test -p macrdp-capture -- --ignored`.
     #[tokio::test]
+    #[ignore = "needs a real display session; SCK segfaults on headless CI"]
     async fn frame_rate_update_keeps_stream_config() {
         // Only a missing TCC grant is a legitimate skip; any `new()` failure past that is a bug.
         // Preflight the TCC grant instead of calling SCShareableContent::get(): on a headless
