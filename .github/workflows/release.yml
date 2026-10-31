@@ -55,14 +55,22 @@ jobs:
           CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          if [ -z "$CERTIFICATE_BASE64" ]; then
-            echo "::error::APPLE_CERTIFICATE secret is not set"
+          # Secrets pasted from `pbcopy` may carry a trailing newline, which
+          # makes `security import` fail with a misleading "wrong password".
+          CERTIFICATE_BASE64="$(printf '%s' "$CERTIFICATE_BASE64" | tr -d '\r\n')"
+          CERTIFICATE_PASSWORD="$(printf '%s' "$CERTIFICATE_PASSWORD" | tr -d '\r\n')"
+          if [ -z "$CERTIFICATE_BASE64" ] || [ -z "$CERTIFICATE_PASSWORD" ]; then
+            echo "::error::APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD secrets are not set"
             exit 1
           fi
           CERT_PATH="$RUNNER_TEMP/macrdp-signing.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/macrdp-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
           printf '%s' "$CERTIFICATE_BASE64" | base64 -D > "$CERT_PATH"
+          if [ "$(wc -c < "$CERT_PATH" | tr -d ' ')" -lt 100 ]; then
+            echo "::error::APPLE_CERTIFICATE did not decode to a valid .p12"
+            exit 1
+          fi
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
