@@ -33,5 +33,3 @@ macrdp-ui/dist/
 # Misc
 *.git.bak/
 **/.git.bak/
-# Local code signing material (private key — never commit)
-.signing/
