@@ -35,14 +35,15 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Focus main window when a second instance is launched
+            // Launching the app again opens (or focuses) the main window.
             if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
                 let _ = window.set_focus();
             }
         }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            Some(vec![]),
+            Some(vec!["--autostart"]),
         ))
         .setup(|app| {
             let handle = app.handle().clone();
@@ -79,6 +80,16 @@ pub fn run() {
                         let _ = w.hide();
                     }
                 });
+            }
+
+            // Started by the login item: stay in the menu bar. A manual launch
+            // (or launching the app again while it runs) opens the main window.
+            let launched_at_login = std::env::args().any(|arg| arg == "--autostart");
+            if !launched_at_login {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
             }
 
             // Hide popover on blur
