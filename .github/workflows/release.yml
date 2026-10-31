@@ -48,12 +48,47 @@ jobs:
       - name: Install frontend dependencies
         run: cd macrdp-ui && npm ci
 
+      # Import the self-signed certificate used to give the app a stable signing
+      # identity across releases (TCC grants are keyed to the certificate root).
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$CERTIFICATE_BASE64" ]; then
+            echo "::error::APPLE_CERTIFICATE secret is not set"
+            exit 1
+          fi
+          CERT_PATH="$RUNNER_TEMP/macrdp-signing.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/macrdp-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 -D > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning
+          rm -f "$CERT_PATH"
+
       - name: Build CLI (release)
         run: cargo build -p macrdp-server --release
 
-      # tauri.conf.json signs ad-hoc (signingIdentity: "-"), no cert needed in CI.
       - name: Build UI + DMG
-        run: cd macrdp-ui && npm run tauri -- build
+        run: >
+          cd macrdp-ui && npm run tauri -- build
+          --config '{"bundle":{"macOS":{"signingIdentity":"macrdp Self-Signed"}}}'
+
+      - name: Verify app signature
+        run: |
+          APP="macrdp-ui/src-tauri/target/release/bundle/macos/macrdp.app"
+          codesign --verify --deep --strict "$APP"
+          codesign -dvv "$APP" 2>&1 | grep -F "Authority=macrdp Self-Signed"
+          codesign -dr - "$APP" 2>&1 | grep -F "certificate root"
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
