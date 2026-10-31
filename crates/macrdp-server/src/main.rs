@@ -64,6 +64,35 @@ impl ServerEventHandler for CliHandler {
     }
 }
 
+/// Open the log file, preferring `./macrdp.log` and falling back to the
+/// platform config directory when the working directory is not writable
+/// (e.g. `/` when launched from a GUI context).
+fn open_log_file() -> Result<(std::fs::File, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("macrdp.log"));
+    }
+    candidates.push(macrdp_core::default_config_dir().join("macrdp.log"));
+
+    let mut last_error = None;
+    for path in candidates {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::File::create(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(error) => {
+                last_error = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("Failed to create log file {}", path.display())),
+                );
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no writable log file location")))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -74,8 +103,7 @@ async fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
-    let log_path = std::env::current_dir().unwrap_or_default().join("macrdp.log");
-    let log_file = std::fs::File::create(&log_path)?;
+    let (log_file, log_path) = open_log_file()?;
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;

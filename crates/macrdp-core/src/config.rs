@@ -143,6 +143,11 @@ impl ServerConfig {
 
 /// Returns the macrdp config directory.
 /// Search order: ./ -> ~/.config/macrdp -> ~/Library/Application Support/macrdp
+///
+/// When no `config.toml` exists anywhere, the platform config directory is
+/// returned instead of the working directory: GUI apps launched from Finder
+/// run with cwd `/`, which is read-only, and generated files must not be
+/// written there.
 pub fn config_dir() -> PathBuf {
     let candidates = config_dir_candidates();
     for dir in &candidates {
@@ -150,10 +155,20 @@ pub fn config_dir() -> PathBuf {
             return dir.clone();
         }
     }
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| PathBuf::from("."))
+    default_config_dir()
+}
+
+/// The platform config directory, guaranteed to be an absolute path outside
+/// the working directory. Used as the fallback for generated files (TLS
+/// certificates, logs) when no user config is present.
+pub fn default_config_dir() -> PathBuf {
+    if let Some(native) = dirs::config_dir() {
+        return native.join("macrdp");
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".config").join("macrdp");
+    }
+    std::env::temp_dir().join("macrdp")
 }
 
 fn config_dir_candidates() -> Vec<PathBuf> {
