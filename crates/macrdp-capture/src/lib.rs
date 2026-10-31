@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
-use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
+use screencapturekit::cv::CVPixelBufferLockFlags;
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
 use tokio::sync::mpsc;
@@ -362,7 +362,7 @@ impl SCStreamOutputTrait for AudioOutputHandler {
             return;
         }
 
-        let Some(audio_buffer_list) = sample.audio_buffer_list() else { return };
+        let Ok(audio_buffer_list) = sample.audio_buffer_list() else { return };
 
         let timestamp = sample.presentation_timestamp();
         let timestamp_ms = if timestamp.timescale > 0 {
@@ -453,31 +453,31 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         _ => {}
     }
 
-    let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
+    let pixel_buffer = sample.pixel_buffer()?;
 
     let guard = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY).ok()?;
 
     let width = guard.width() as u32;
     let height = guard.height() as u32;
     let stride = guard.bytes_per_row();
-    let pixels = guard.as_slice();
+    let pixels = unsafe { guard.as_slice()? };
 
     if width == 0 || height == 0 || pixels.is_empty() {
         return None;
     }
 
     // Extract dirty rects from the sample buffer
-    // Extract dirty rects — screencapturekit's CGRect has x/y/width/height fields
+    // Extract dirty rects — screencapturekit's CGRect has origin/size fields
     let dirty_rects = sample
         .dirty_rects()
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| r.width > 0.0 && r.height > 0.0)
+        .filter(|r| r.size.width > 0.0 && r.size.height > 0.0)
         .map(|r| Rect {
-            x: r.x.max(0.0) as u32,
-            y: r.y.max(0.0) as u32,
-            width: r.width as u32,
-            height: r.height as u32,
+            x: r.origin.x.max(0.0) as u32,
+            y: r.origin.y.max(0.0) as u32,
+            width: r.size.width as u32,
+            height: r.size.height as u32,
         })
         .collect::<Vec<_>>();
 
@@ -519,7 +519,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         _ => {}
     }
 
-    let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
+    let pixel_buffer = sample.pixel_buffer()?;
 
     // width()/height() read from the CVPixelBuffer header — no lock required
     let width = pixel_buffer.width() as u32;
@@ -534,12 +534,12 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         .dirty_rects()
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| r.width > 0.0 && r.height > 0.0)
+        .filter(|r| r.size.width > 0.0 && r.size.height > 0.0)
         .map(|r| Rect {
-            x: r.x.max(0.0) as u32,
-            y: r.y.max(0.0) as u32,
-            width: r.width as u32,
-            height: r.height as u32,
+            x: r.origin.x.max(0.0) as u32,
+            y: r.origin.y.max(0.0) as u32,
+            width: r.size.width as u32,
+            height: r.size.height as u32,
         })
         .collect::<Vec<_>>();
 
@@ -638,7 +638,7 @@ impl ScreenCapturer {
         let filter = SCContentFilter::create()
             .with_display(&display)
             .with_excluding_windows(&[])
-            .build();
+            .build()?;
 
         let frame_interval = CMTime::new(1, config.frame_rate as i32);
 
@@ -660,8 +660,11 @@ impl ScreenCapturer {
             .with_queue_depth(4)
             // Match the encoder: BT.601 matrix, sRGB primaries.
             // Values are the CFString contents of kCGDisplayStreamYCbCrMatrix_ITU_R_601_4 / kCGColorSpaceSRGB.
-            .with_color_matrix("ITU_R_601_4")
-            .with_color_space_name("kCGColorSpaceSRGB")
+            // screencapturekit 11 retains these values for the configuration's lifetime;
+            // newer SCK declares both as `assign`, so a dangling CFString would make
+            // SCStream's configuration copy crash.
+            .with_color_matrix("ITU_R_601_4")?
+            .with_color_space_name("kCGColorSpaceSRGB")?
             .with_minimum_frame_interval(&frame_interval)
             .with_pixel_format(match config.pixel_format {
                 // Must match the encoder session's NV12 tag (see `K_CV_PIXEL_FORMAT_NV12` in
@@ -687,15 +690,15 @@ impl ScreenCapturer {
             dropped: std::sync::atomic::AtomicU64::new(0),
         };
 
-        let mut stream = SCStream::new(&filter, &stream_config);
-        stream.add_output_handler(video_handler, SCStreamOutputType::Screen);
+        let mut stream = SCStream::new(&filter, &stream_config)?;
+        stream.add_output_handler(video_handler, SCStreamOutputType::Screen)?;
 
         // Register audio handler only if a sender was provided
         if let Some(tx) = audio_tx {
             let audio_handler = AudioOutputHandler {
                 audio_tx: Arc::new(tx),
             };
-            stream.add_output_handler(audio_handler, SCStreamOutputType::Audio);
+            stream.add_output_handler(audio_handler, SCStreamOutputType::Audio)?;
         }
 
         let stream = Arc::new(stream);
@@ -773,8 +776,13 @@ impl Drop for ScreenCapturer {
             }
         };
         let stream = Arc::clone(&self.stream);
+        // SCK copies the configuration into the stream by pointer (its color properties are
+        // `assign`), so the retained CFStrings live as long as this config object. Keep a
+        // reference alive until stop_capture returns instead of letting `config` drop first.
+        let keep_config = self.config.clone();
         let spawned = std::thread::Builder::new().name("sck-stopCapture".into()).spawn(move || {
             let _guard = guard;
+            let _config = keep_config;
             if let Err(e) = stream.stop_capture() {
                 tracing::warn!(error = ?e, "Screen capture stop");
             }
