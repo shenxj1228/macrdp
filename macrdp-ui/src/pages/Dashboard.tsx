@@ -16,7 +16,7 @@ function Dashboard() {
   const status = useServerStatus();
   const { metrics, stale } = useMetrics();
   const connections = useConnections();
-  const [loading, setLoading] = useState(false);
+  const [pending, setPending] = useState<"start" | "stop" | null>(null);
   const [config, setConfig] = useState<UiConfig | null>(null);
 
   const metricsAvailable = status.running && metrics && !stale;
@@ -32,37 +32,43 @@ function Dashboard() {
     api.getConfig().then(setConfig).catch(console.error);
   }, []);
 
-  // Clear loading when backend state actually changes
+  // Clear the pending action once the backend reports the outcome it was waiting for.
+  // A stale status snapshot must not flip the button back to "启动" mid-start.
   useEffect(() => {
-    if (loading && (status.state === "running" || status.state === "error")) {
-      setLoading(false);
-    }
-    if (loading && status.state === "stopped" && !status.running) {
-      // stopServer completed
-      const timer = setTimeout(() => setLoading(false), 500);
-      return () => clearTimeout(timer);
-    }
-  }, [status.state, status.running, loading]);
+    if (!pending) return;
+    const settled =
+      pending === "start"
+        ? status.state === "running" || status.state === "error"
+        : status.state === "stopped" || status.state === "error";
+    if (settled) setPending(null);
+  }, [pending, status.state]);
+
+  // Safety net: a lost event must not leave the button spinning forever.
+  useEffect(() => {
+    if (!pending) return;
+    const timer = setTimeout(() => setPending(null), 15000);
+    return () => clearTimeout(timer);
+  }, [pending]);
 
   const handleStart = async () => {
-    if (loading) return;
-    setLoading(true);
+    if (pending) return;
+    setPending("start");
     try {
       await api.startServer();
     } catch (err: unknown) {
       console.error("Failed to start server:", err);
-      setLoading(false);
+      setPending(null);
     }
   };
 
   const handleStop = async () => {
-    if (loading) return;
-    setLoading(true);
+    if (pending) return;
+    setPending("stop");
     try {
       await api.stopServer();
     } catch (err: unknown) {
       console.error("Failed to stop server:", err);
-      setLoading(false);
+      setPending(null);
     }
   };
 
@@ -80,7 +86,7 @@ function Dashboard() {
     <div className="flex flex-col gap-3 p-4 overflow-y-auto">
       <StatusBar
         state={status.state}
-        loading={loading}
+        pending={pending}
         port={port}
         uptimeSeconds={status.uptime_secs}
         onStart={handleStart}

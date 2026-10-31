@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/refs/heads/dev/crates/tauri-schema-generator/schemas/config.schema.json",
   "productName": "macrdp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.macrdp.app",
   "build": {
     "frontendDist": "../dist",
@@ -40,7 +40,7 @@
     ],
     "trayIcon": {
       "id": "main-tray",
-      "iconPath": "icons/icon.png",
+      "iconPath": "icons/tray.png",
       "iconAsTemplate": true
     },
     "security": {

@@ -2,8 +2,8 @@ import { useRef, useCallback } from "react";
 import { Play, Square, Loader2 } from "lucide-react";
 
 interface StatusBarProps {
-  state: "running" | "starting" | "stopped" | "error";
-  loading?: boolean;
+  state: "running" | "starting" | "stopping" | "stopped" | "error";
+  pending?: "start" | "stop" | null;
   port?: number;
   uptimeSeconds?: number;
   errorMessage?: string;
@@ -33,6 +33,11 @@ const statusConfig: Record<
     glowColor: "0 0 6px var(--color-yellow)",
     label: "启动中...",
   },
+  stopping: {
+    dotClass: "bg-yellow",
+    glowColor: "0 0 6px var(--color-yellow)",
+    label: "停止中...",
+  },
   stopped: {
     dotClass: "bg-text-muted",
     glowColor: "none",
@@ -49,7 +54,7 @@ const DEBOUNCE_MS = 1500;
 
 function StatusBar({
   state,
-  loading = false,
+  pending = null,
   port,
   uptimeSeconds,
   errorMessage,
@@ -58,9 +63,11 @@ function StatusBar({
 }: StatusBarProps) {
   const config = statusConfig[state];
   const isError = state === "error";
-  const isLoading = loading || state === "starting";
-  const showStop = state === "running" || state === "starting" || (loading && state !== "stopped");
-  const buttonsDisabled = isLoading;
+  // What the user is waiting for: the locally-issued action wins over the last status.
+  const busyKind =
+    pending ?? (state === "starting" ? "start" : state === "stopping" ? "stop" : null);
+  const busy = busyKind !== null;
+  const target: "start" | "stop" = busyKind ?? (state === "running" ? "stop" : "start");
   const lastClickRef = useRef(0);
 
   const debounced = useCallback(
@@ -80,7 +87,7 @@ function StatusBar({
   return (
     <div className={wrapperClass} role="status" aria-live="polite">
       <div className="flex items-center gap-2 flex-1 min-w-0">
-        {isLoading ? (
+        {busy ? (
           <Loader2 className="h-3.5 w-3.5 text-yellow animate-spin shrink-0" />
         ) : (
           <span
@@ -102,33 +109,30 @@ function StatusBar({
       </div>
 
       <div className="shrink-0 ml-2">
-        {showStop ? (
-          <button
-            onClick={() => debounced(onStop)}
-            disabled={buttonsDisabled}
-            className="inline-flex items-center gap-1.5 rounded-md bg-red/10 px-2.5 py-1 text-xs font-medium text-red hover:bg-red/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {isLoading ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Square className="h-3 w-3" />
-            )}
-            {isLoading ? "处理中..." : "停止"}
-          </button>
-        ) : (
-          <button
-            onClick={() => debounced(onStart)}
-            disabled={buttonsDisabled}
-            className="inline-flex items-center gap-1.5 rounded-md bg-green/10 px-2.5 py-1 text-xs font-medium text-green hover:bg-green/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {isLoading ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Play className="h-3 w-3" />
-            )}
-            {isLoading ? "处理中..." : "启动"}
-          </button>
-        )}
+        <button
+          onClick={() => debounced(target === "stop" ? onStop : onStart)}
+          disabled={busy}
+          className={
+            target === "stop"
+              ? "inline-flex items-center gap-1.5 rounded-md bg-red/10 px-2.5 py-1 text-xs font-medium text-red hover:bg-red/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              : "inline-flex items-center gap-1.5 rounded-md bg-green/10 px-2.5 py-1 text-xs font-medium text-green hover:bg-green/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          }
+        >
+          {busy ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : target === "stop" ? (
+            <Square className="h-3 w-3" />
+          ) : (
+            <Play className="h-3 w-3" />
+          )}
+          {busy
+            ? target === "stop"
+              ? "停止中..."
+              : "启动中..."
+            : target === "stop"
+              ? "停止"
+              : "启动"}
+        </button>
       </div>
     </div>
   );

@@ -31,15 +31,12 @@ impl TauriEventBridge {
 
 impl ServerEventHandler for TauriEventBridge {
     fn on_status_change(&self, status: ServerStatus) {
-        let app = self.app.clone();
-        let status_clone = status.clone();
-        tokio::spawn(async move {
-            if let Some(state) = app.try_state::<Arc<AppState>>() {
-                let mut guard = state.status.lock().await;
-                *guard = status_clone.clone();
-            }
-            let _ = app.emit("server-status", &status_clone);
-        });
+        // Applied synchronously: the core emits "starting" and "running" back to back, and
+        // spawned updates could arrive out of order (leaving the UI on a stale status).
+        if let Some(state) = self.app.try_state::<Arc<AppState>>() {
+            *state.status.lock().unwrap() = status.clone();
+        }
+        let _ = self.app.emit("server-status", &status);
     }
 
     fn on_metrics(&self, metrics: Metrics) {

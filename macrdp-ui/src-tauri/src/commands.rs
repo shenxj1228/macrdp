@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use tauri::Emitter;
-use tauri::Manager;
 use tauri::State;
 
 use serde::Serialize;
@@ -43,18 +42,23 @@ pub async fn start_server(
         .await
         .map_err(|e| format!("Failed to start server: {}", e))?;
 
+    // Store the handle and publish the live status. The core emits "starting" before its
+    // slow setup and "running" before returning, so the UI never sees a stale "stopped"
+    // status after this command.
     let port = handle.port();
-    tracing::info!(port, "Server started successfully");
-
-    // Store the handle
+    let live_status = handle.status();
     {
         let mut guard = state.server_handle.lock().await;
         *guard = Some(handle);
     }
+    tracing::info!(port, "Server started successfully");
 
     // Emit status update
-    let status = state.status.lock().await.clone();
-    let _ = app.emit("server-status", &status);
+    {
+        let mut status = state.status.lock().unwrap();
+        *status = live_status.clone();
+    }
+    let _ = app.emit("server-status", &live_status);
 
     Ok(())
 }
@@ -72,6 +76,15 @@ pub async fn stop_server(
         guard.take()
     };
 
+    // Tell the UI a stop is in flight: joining the server thread can take a moment when a
+    // client is connected, and the button must not look like nothing happened.
+    {
+        let mut status = state.status.lock().unwrap();
+        status.running = true;
+        status.state = "stopping".to_string();
+        let _ = app.emit("server-status", &*status);
+    }
+
     if let Some(handle) = handle {
         handle
             .stop()
@@ -81,15 +94,12 @@ pub async fn stop_server(
 
     // Update status
     {
-        let mut status = state.status.lock().await;
+        let mut status = state.status.lock().unwrap();
         status.running = false;
         status.state = "stopped".to_string();
         status.uptime_secs = 0;
+        let _ = app.emit("server-status", &*status);
     }
-    let _ = app.emit(
-        "server-status",
-        &*state.status.lock().await,
-    );
 
     // Clear metrics and connections
     {
@@ -108,16 +118,18 @@ pub async fn stop_server(
 pub async fn get_server_status(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    // If we have a live handle, refresh from it
+    // If we have a live handle, refresh from it — except while a stop is in flight, where
+    // the handle still reports "running" and would overwrite the "stopping" state.
     {
         let guard = state.server_handle.lock().await;
         if let Some(ref handle) = *guard {
-            let live_status = handle.status();
-            let mut status = state.status.lock().await;
-            *status = live_status;
+            let mut status = state.status.lock().unwrap();
+            if status.state != "stopping" {
+                *status = handle.status();
+            }
         }
     }
-    let status = state.status.lock().await.clone();
+    let status = state.status.lock().unwrap().clone();
     serde_json::to_value(&status).map_err(|e| e.to_string())
 }
 
@@ -269,12 +281,8 @@ pub fn check_for_updates() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.show().map_err(|e: tauri::Error| e.to_string())?;
-        window
-            .set_focus()
-            .map_err(|e: tauri::Error| e.to_string())?;
-    }
+    #[cfg(target_os = "macos")]
+    crate::show_main_window(&app);
     Ok(())
 }
 
@@ -288,16 +296,16 @@ pub async fn quit_app(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    // Stop the server if running
+    // Never block quitting on the server thread: a connected client can make the join take
+    // a while, and the process exit below tears the server down anyway.
     let handle = {
         let mut guard = state.server_handle.lock().await;
         guard.take()
     };
-
     if let Some(handle) = handle {
-        if let Err(e) = handle.stop().await {
-            tracing::warn!("Error stopping server during quit: {}", e);
-        }
+        tauri::async_runtime::spawn(async move {
+            let _ = handle.stop().await;
+        });
     }
 
     app.exit(0);

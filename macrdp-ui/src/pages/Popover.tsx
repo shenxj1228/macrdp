@@ -6,6 +6,7 @@ import {
   Play,
   Square,
   Monitor,
+  Loader2,
 } from "lucide-react";
 import { useServerStatus } from "../hooks/useServerStatus";
 import { useMetrics } from "../hooks/useMetrics";
@@ -26,14 +27,21 @@ function Popover() {
   const status = useServerStatus();
   const { metrics, stale } = useMetrics();
   const connections = useConnections();
-  const [toggling, setToggling] = useState(false);
+  const [intent, setIntent] = useState<"start" | "stop" | null>(null);
 
   const metricsAvailable = metrics && !stale;
 
+  const busy = intent !== null || status.state === "starting" || status.state === "stopping";
+  const busyKind =
+    intent ?? (status.state === "starting" ? "start" : status.state === "stopping" ? "stop" : null);
+  const stopLook = busyKind === "stop" || (busyKind === null && status.running);
+
   const handleToggle = async () => {
-    setToggling(true);
+    if (busy) return;
+    const action = status.running ? "stop" : "start";
+    setIntent(action);
     try {
-      if (status.running) {
+      if (action === "stop") {
         await api.stopServer();
       } else {
         await api.startServer();
@@ -41,14 +49,13 @@ function Popover() {
     } catch (err) {
       console.error("Failed to toggle server:", err);
     } finally {
-      setToggling(false);
+      setIntent(null);
     }
   };
 
   const handleQuit = () => {
-    if (window.confirm("确定退出 macrdp？")) {
-      api.quitApp();
-    }
+    // No window.confirm here: WKWebView can swallow it, which left the button dead.
+    api.quitApp().catch(console.error);
   };
 
   const handleShowMain = () => {
@@ -63,7 +70,7 @@ function Popover() {
   const extraCount = connections.length - 3;
 
   return (
-    <div className="min-h-screen bg-[rgba(245,245,247,0.95)] backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
+    <div className="min-h-screen bg-popover/95 text-popover-foreground backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
       <div className="flex flex-col p-3.5 gap-3">
         {/* Header row */}
         <div className="flex items-center justify-between">
@@ -86,6 +93,7 @@ function Popover() {
               size="icon-xs"
               onClick={handleShowMain}
               title="设置"
+              className="text-foreground"
             >
               <Settings className="h-3.5 w-3.5" />
             </Button>
@@ -196,13 +204,18 @@ function Popover() {
         {/* Action buttons row */}
         <div className="grid grid-cols-3 gap-2">
           <Button
-            variant={status.running ? "destructive" : "default"}
+            variant={stopLook ? "destructive" : "default"}
             size="sm"
-            disabled={toggling || status.state === "starting"}
+            disabled={busy}
             onClick={handleToggle}
             className="w-full"
           >
-            {status.running ? (
+            {busy ? (
+              <>
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {busyKind === "stop" ? "停止中..." : "启动中..."}
+              </>
+            ) : status.running ? (
               <><Square className="h-3 w-3" /> 停止</>
             ) : (
               <><Play className="h-3 w-3" /> 启动</>

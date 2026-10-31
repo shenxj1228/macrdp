@@ -13,6 +13,20 @@ use tauri_plugin_autostart::MacosLauncher;
 
 use database::Database;
 
+/// Show the main window and switch back to a regular foreground app.
+///
+/// In the background the app is an accessory (menu-bar only): no Dock icon and no app
+/// menu. The main window needs a regular app so it gets the menu bar and the standard
+/// editing shortcuts (⌘C/⌘V in the config fields).
+#[cfg(target_os = "macos")]
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() {
     // Load UI config early to get log level
     let ui_config = ui_config::UiConfig::load().unwrap_or_default();
@@ -36,10 +50,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Launching the app again opens (or focuses) the main window.
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            crate::show_main_window(app);
         }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -71,25 +82,28 @@ pub fn run() {
             // Setup tray icon
             tray::setup_tray(&handle)?;
 
-            // Intercept main window close — hide instead of quit
+            // Intercept main window close — hide instead of quit, and go back to being a
+            // menu-bar-only app (no Dock icon while it runs in the background).
             if let Some(window) = app.get_webview_window("main") {
                 let w = window.clone();
+                let h = handle.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = w.hide();
+                        #[cfg(target_os = "macos")]
+                        let _ = h.set_activation_policy(tauri::ActivationPolicy::Accessory);
                     }
                 });
             }
 
             // Started by the login item: stay in the menu bar. A manual launch
             // (or launching the app again while it runs) opens the main window.
+            #[cfg(target_os = "macos")]
+            let _ = handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let launched_at_login = std::env::args().any(|arg| arg == "--autostart");
             if !launched_at_login {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                crate::show_main_window(&handle);
             }
 
             // Hide popover on blur

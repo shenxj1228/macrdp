@@ -28,7 +28,9 @@ pub type SharedServerHandle = Arc<Mutex<Option<Arc<ServerHandle>>>>;
 
 /// Application-wide shared state.
 pub struct AppState {
-    pub status: Mutex<ServerStatus>,
+    /// Plain std mutex: status changes come from the server thread and must be applied in
+    /// order, so the bridge can update and emit synchronously without a tokio round-trip.
+    pub status: std::sync::Mutex<ServerStatus>,
     pub metrics: Mutex<Metrics>,
     pub connections: Mutex<Vec<Connection>>,
     pub logs: Mutex<VecDeque<LogEntry>>,
@@ -39,7 +41,7 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
-            status: Mutex::new(ServerStatus::default()),
+            status: std::sync::Mutex::new(ServerStatus::default()),
             metrics: Mutex::new(Metrics::default()),
             connections: Mutex::new(Vec::new()),
             logs: Mutex::new(VecDeque::new()),

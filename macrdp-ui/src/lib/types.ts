@@ -1,6 +1,6 @@
 export interface ServerStatus {
   running: boolean;
-  state: "stopped" | "running" | "starting" | "error";
+  state: "stopped" | "running" | "starting" | "stopping" | "error";
   uptime_secs: number;
   pid: number | null;
 }
