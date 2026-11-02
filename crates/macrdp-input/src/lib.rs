@@ -1,5 +1,6 @@
 //! Keyboard and mouse input injection via CGEvent
 
+pub mod ime;
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
