@@ -27,6 +27,8 @@ pub struct UiConfig {
     #[serde(alias = "hidpi_scale")]
     pub resolution: String,
     pub show_cursor: bool,
+    /// Keep the display awake while the server runs (avoids the lock screen blocking input).
+    pub keep_display_awake: bool,
 
     // ── Application ─────────────────────────────────────────
     pub log_level: String,
@@ -49,6 +51,7 @@ impl Default for UiConfig {
             password: String::new(),
             resolution: "auto".to_string(),
             show_cursor: false,
+            keep_display_awake: false,
             log_level: "warn".to_string(),
             theme: "system".to_string(),
             autostart: false,
@@ -176,6 +179,11 @@ impl UiConfig {
                     .as_bool()
                     .ok_or("show_cursor must be a boolean")?;
             }
+            "keep_display_awake" => {
+                self.keep_display_awake = value
+                    .as_bool()
+                    .ok_or("keep_display_awake must be a boolean")?;
+            }
             "log_level" => {
                 self.log_level = value
                     .as_str()
@@ -225,6 +233,7 @@ impl UiConfig {
             chroma_mode: Some(self.chroma_mode.clone()),
             resolution: Some(self.resolution.clone()),
             show_cursor: Some(self.show_cursor),
+            keep_display_awake: self.keep_display_awake,
             cursor_mode: None,
             bitrate_mbps: Some(self.bitrate_mbps),
             max_qp: None,

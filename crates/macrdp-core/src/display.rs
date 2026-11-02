@@ -182,6 +182,20 @@ impl RdpServerDisplay for MacDisplay {
         }
         let zero_copy = encoder.as_ref().is_some_and(|e| e.supports_pixel_buffer()) && !self.mode_444;
 
+        // A client is starting a session: wake a sleeping display (ScreenCaptureKit only lists
+        // awakened displays) and keep it awake while the session lives, like a Windows RDP host.
+        // The display may otherwise sleep mid-stream and blank the capture.
+        crate::power::wake_display();
+        let display_sleep = crate::power::DisplaySleepGuard::hold();
+        if crate::power::screen_is_locked() {
+            tracing::warn!(
+                "Screen is locked: macOS does not allow third-party apps to type into the lock \
+                 screen, so the client can only view it. Set System Settings > Lock Screen > \
+                 \"Require password\" to a delay (or Never) so display sleep does not lock the \
+                 Mac, or unlock it on the Mac itself."
+            );
+        }
+
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
@@ -243,6 +257,7 @@ impl RdpServerDisplay for MacDisplay {
             capture_format_dirty: false,
             flush_fail_streak: 0,
             next_flush_at: Instant::now(),
+            _display_sleep: display_sleep,
         }))
     }
 }
@@ -373,6 +388,8 @@ struct MacDisplayUpdates {
     flush_fail_streak: u32,
     /// Earliest time for the next flush replay (see `flush_fail_streak`).
     next_flush_at: Instant,
+    /// Keeps the display awake for the duration of this session (dropped on disconnect).
+    _display_sleep: crate::power::DisplaySleepGuard,
 }
 
 /// How long to wait for the client to open and negotiate the GFX channel before falling

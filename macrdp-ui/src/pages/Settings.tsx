@@ -297,6 +297,16 @@ function Settings() {
                 onCheckedChange={(checked) => updateConfig("show_cursor", checked)}
               />
             </SettingRow>
+
+            <SettingRow
+              label="保持屏幕常亮"
+              description="服务运行期间不让显示器休眠。息屏会锁屏，而 macOS 不允许远程在锁屏界面输入，开启后可避免连上后停在锁屏"
+            >
+              <Switch
+                checked={config.keep_display_awake}
+                onCheckedChange={(checked) => updateConfig("keep_display_awake", checked)}
+              />
+            </SettingRow>
           </CategorySection>
         )}
 

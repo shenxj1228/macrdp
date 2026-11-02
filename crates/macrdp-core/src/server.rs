@@ -66,8 +66,10 @@ pub struct ServerHandle {
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
     config_tx: tokio::sync::mpsc::UnboundedSender<ConfigUpdate>,
-    /// Keeps the display and system awake for as long as the server runs (released on stop).
+    /// Keeps the system awake for as long as the server runs (released on stop).
     _power: crate::power::RemoteSessionPower,
+    /// Optional: keeps the display awake while the server runs (config `keep_display_awake`).
+    _display_awake: Option<crate::power::DisplaySleepGuard>,
 }
 
 impl ServerHandle {
@@ -430,6 +432,9 @@ async fn start_server_inner(
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(Some(metrics_task)),
         config_tx,
+        _display_awake: config
+            .keep_display_awake
+            .then(crate::power::DisplaySleepGuard::hold),
         _power: crate::power::RemoteSessionPower::hold(),
     });
 

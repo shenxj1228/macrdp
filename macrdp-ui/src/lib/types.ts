@@ -67,6 +67,7 @@ export interface UiConfig {
   password: string;
   resolution: string;
   show_cursor: boolean;
+  keep_display_awake: boolean;
   log_level: string;
   theme: string;
   autostart: boolean;

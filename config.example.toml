@@ -45,6 +45,13 @@ frame_rate = 60
 # Mouse coordinates are automatically mapped back to logical points.
 # resolution = "3840x2160"
 
+# Keep the display awake while the server runs
+# Default: false
+# macOS does not let third-party apps type into the lock screen, and display sleep locks the
+# Mac on default settings. With false, a client wakes the display on connect (fine only if
+# "Require password after display sleep" is set to a delay). Set true to keep the display on.
+# keep_display_awake = true
+
 # ─── Encoding ──────────────────────────────────────────────────────────────────
 
 # Video quality preset
