@@ -131,7 +131,10 @@ pub struct CaptureConfig {
 
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
-    stream: Arc<SCStream>,
+    /// `None` when no SCStream could be created (no shareable display). The slot is closed in
+    /// that case, so `next_frame` reports the stream as stopped and the caller falls back to
+    /// CoreGraphics capture until a rebuild succeeds.
+    stream: Option<Arc<SCStream>>,
     slot: Arc<LatestSlot<CaptureEvent>>,
     /// The full stream configuration: SCK's updateConfiguration replaces the whole object,
     /// so a frame-rate change must resend size/pixel format/cursor/queue depth too.
@@ -618,11 +621,26 @@ impl ScreenCapturer {
             .await?
             .context("Failed to get shareable content (Screen Recording permission needed)")?;
 
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .context("No display found")?;
+        let Some(display) = content.displays().into_iter().next() else {
+            // No shareable display: the display is asleep (ScreenCaptureKit only lists awakened
+            // displays) or Screen Recording is not granted. Do not fail the session — the
+            // caller serves frames from the CoreGraphics fallback, which keeps reading the
+            // framebuffer while the panel is off, and rebuilds the stream once SCK sees a
+            // display again. `next_frame` on a closed slot returns `None`, which is the
+            // signal that puts the display loop on that path.
+            tracing::warn!(
+                "No shareable display (display asleep or Screen Recording not granted) — \
+                 using the CoreGraphics fallback until ScreenCaptureKit can capture"
+            );
+            let slot: Arc<LatestSlot<CaptureEvent>> = Arc::default();
+            slot.close();
+            return Ok(Self {
+                stream: None,
+                slot,
+                config: SCStreamConfiguration::new(),
+                busy: Arc::default(),
+            });
+        };
 
         let actual_width = if config.width == 0 {
             display.width() as u32
@@ -725,7 +743,7 @@ impl ScreenCapturer {
             "Screen capture started"
         );
 
-        Ok(Self { stream, slot, config: stream_config, busy })
+        Ok(Self { stream: Some(stream), slot, config: stream_config, busy })
     }
 
     /// Receive the next capture event (async, cancellation safe)
@@ -744,16 +762,26 @@ impl ScreenCapturer {
         self.slot.close();
     }
 
+    /// True when an SCStream is running. False while serving the CoreGraphics fallback.
+    pub fn is_live(&self) -> bool {
+        self.stream.is_some()
+    }
+
     /// Update capture frame rate at runtime. Blocks until SCK confirms the new
     /// configuration, at most 2 s. Prefer [`Self::set_frame_rate_async`] from tokio tasks.
     pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
-        apply_frame_rate(Arc::clone(&self.stream), self.config.clone(), &self.busy, fps)
+        match &self.stream {
+            Some(stream) => apply_frame_rate(Arc::clone(stream), self.config.clone(), &self.busy, fps),
+            None => Ok(()),
+        }
     }
 
     /// Same as [`Self::set_frame_rate`] but runs the blocking SCK call on
     /// `spawn_blocking`, so it never stalls a tokio worker thread.
     pub async fn set_frame_rate_async(&self, fps: u32) -> anyhow::Result<()> {
-        let stream = Arc::clone(&self.stream);
+        let Some(stream) = self.stream.as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
         let config = self.config.clone();
         let busy = Arc::clone(&self.busy);
         tokio::task::spawn_blocking(move || apply_frame_rate(stream, config, &busy, fps)).await?
@@ -768,6 +796,9 @@ impl Drop for ScreenCapturer {
     /// hung SCK would otherwise stall the (current_thread) runtime that drops us.
     fn drop(&mut self) {
         self.slot.close();
+        let Some(stream) = self.stream.as_ref().map(Arc::clone) else {
+            return;
+        };
         let guard = match sck_claim(&self.busy, "stopCapture") {
             Ok(g) => g,
             Err(e) => {
@@ -775,7 +806,6 @@ impl Drop for ScreenCapturer {
                 return;
             }
         };
-        let stream = Arc::clone(&self.stream);
         // SCK copies the configuration into the stream by pointer (its color properties are
         // `assign`), so the retained CFStrings live as long as this config object. Keep a
         // reference alive until stop_capture returns instead of letting `config` drop first.

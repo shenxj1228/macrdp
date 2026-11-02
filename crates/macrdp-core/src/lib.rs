@@ -9,6 +9,7 @@ pub mod handler;
 pub mod log_bridge;
 pub mod permissions;
 pub mod perf_stats;
+pub mod power;
 pub mod server;
 pub mod tls;
 

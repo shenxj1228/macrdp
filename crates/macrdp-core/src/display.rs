@@ -719,13 +719,22 @@ impl MacDisplayUpdates {
         let fallback = CgFallbackCapturer::new(&self.capture_config);
         loop {
             if self.last_sck_retry.is_none_or(|t| t.elapsed() >= SCK_RETRY_INTERVAL) {
-                tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
+                if self.last_sck_retry.is_none() {
+                    tracing::warn!(
+                        "ScreenCaptureKit has no display to capture (display asleep or screen \
+                         locked) — serving CoreGraphics frames and retrying"
+                    );
+                }
                 self.last_sck_retry = Some(Instant::now());
+                // A capturer without a stream means SCK still has no display to share (display
+                // asleep): keep serving CG frames instead of announcing a bogus recovery.
                 if let Ok(new_capturer) = self.new_capturer().await {
-                    tracing::info!("SCStream recovered — switching back from CoreGraphics");
-                    self.capturer = new_capturer;
-                    self.last_sck_retry = None;
-                    return Ok(None);
+                    if new_capturer.is_live() {
+                        tracing::info!("SCStream recovered — switching back from CoreGraphics");
+                        self.capturer = new_capturer;
+                        self.last_sck_retry = None;
+                        return Ok(None);
+                    }
                 }
             }
             // Throttle to the configured fps on both the success and the failure path.
