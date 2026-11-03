@@ -269,6 +269,10 @@ pub struct GfxState {
     pub show_cursor: Option<bool>,
     /// Hot-updatable: resolution (set via ConfigUpdate)
     pub resolution: Option<String>,
+    /// Whether `resolution` is an explicit size that must not be overridden by the client.
+    /// High-DPI clients (e.g. mstsc at 150%) request their logical window size, which is
+    /// smaller than the physical screen; honoring it leaves black borders in full screen.
+    pub fixed_resolution: bool,
     /// Hot-updatable: encoder preference (set via ConfigUpdate)
     pub encoder_pref: Option<String>,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
@@ -315,6 +319,7 @@ impl GfxState {
             target_bitrate: None,
             show_cursor: None,
             resolution: None,
+            fixed_resolution: false,
             encoder_pref: None,
             chroma_mode: None,
             max_qp: None,
@@ -431,6 +436,7 @@ impl GfxState {
         fresh.target_bitrate = self.target_bitrate;
         fresh.show_cursor = self.show_cursor;
         fresh.resolution = self.resolution.take();
+        fresh.fixed_resolution = self.fixed_resolution;
         fresh.encoder_pref = self.encoder_pref.take();
         fresh.chroma_mode = self.chroma_mode.take();
         fresh.max_qp = self.max_qp;
@@ -1220,6 +1226,7 @@ mod tests {
         s.encoder_pref = Some("software".into());
         s.chroma_mode = Some("avc444".into());
         s.resolution = Some("1280x720".into());
+        s.fixed_resolution = true;
         s.peer_addr = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
         s.reset_session();
@@ -1231,6 +1238,7 @@ mod tests {
         assert_eq!(s.encoder_pref.as_deref(), Some("software"));
         assert_eq!(s.chroma_mode.as_deref(), Some("avc444"));
         assert_eq!(s.resolution.as_deref(), Some("1280x720"));
+        assert!(s.fixed_resolution);
         assert!(s.peer_addr.is_some());
     }
 

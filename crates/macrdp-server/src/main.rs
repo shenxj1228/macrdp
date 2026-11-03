@@ -120,6 +120,10 @@ async fn main() -> Result<()> {
 
     eprintln!("Log file: {}", log_path.display());
 
+    // HIToolbox's TIS calls must run on the main thread; cache IME availability before the
+    // RDP server thread starts handling keys.
+    macrdp_core::ime::prime();
+
     tracing::info!(?config, "macrdp server starting");
 
     // Create shared performance stats (enabled via --perf flag)

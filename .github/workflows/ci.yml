@@ -15,7 +15,8 @@ permissions:
 
 jobs:
   build:
-    # ScreenCaptureKit + swift build need full Xcode; macOS runners ship with it.
+    # Full Xcode is not required: the project only links the system Swift runtime (no swiftc
+    # build step). macOS runners ship Xcode anyway.
     runs-on: macos-26
     timeout-minutes: 60
 

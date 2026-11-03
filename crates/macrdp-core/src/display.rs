@@ -30,8 +30,6 @@ pub struct MacDisplay {
     /// Maximum resolution (auto-detected or configured). Client cannot exceed this.
     max_width: u16,
     max_height: u16,
-    /// Whether resolution is fixed by config (true) or follows client (false)
-    fixed_resolution: bool,
     frame_rate: u32,
     quality: Quality,
     encoder_pref: macrdp_encode::EncoderPreference,
@@ -57,7 +55,6 @@ pub struct MacDisplay {
 impl MacDisplay {
     pub fn new(
         width: u16, height: u16,
-        fixed_resolution: bool,
         frame_rate: u32, quality: Quality,
         encoder_pref: macrdp_encode::EncoderPreference,
         mode_444: bool,
@@ -82,7 +79,6 @@ impl MacDisplay {
         Self {
             width, height,
             max_width: max_w, max_height: max_h,
-            fixed_resolution,
             frame_rate, quality, encoder_pref, mode_444, show_cursor, cursor_pdu, bitrate_override, base_bitrate, gfx_state,
             coord_mapper,
             shared_audio_tx,
@@ -124,9 +120,22 @@ impl RdpServerDisplay for MacDisplay {
         DesktopSize { width: self.width, height: self.height }
     }
 
+    /// The client's window defines the session size, as with Windows RDP: adopt whatever it
+    /// announces (clamped to the physical display). The configured `resolution` is only the
+    /// default used before/without a client request — forcing it here made the desktop larger
+    /// or smaller than the client canvas, which mstsc renders scaled down with black borders.
+    ///
+    /// When the configured resolution is an explicit WxH, the size is fixed instead: a
+    /// high-DPI client asks for its logical window size (e.g. 2560×1440 at 150%), which mstsc
+    /// then shows 1:1 inside a 3840×2160 full-screen window — black borders on all sides.
     fn request_resize(&mut self, width: u16, height: u16) {
-        if self.fixed_resolution {
-            tracing::debug!("Ignoring resize request — resolution is fixed by config");
+        let fixed = self.gfx_state.lock().unwrap().fixed_resolution;
+        if fixed {
+            tracing::info!(
+                client_w = width, client_h = height,
+                server_w = self.width, server_h = self.height,
+                "Ignoring client resolution request: explicit resolution is fixed"
+            );
             return;
         }
         self.apply_resize(width, height, "client-requested");
@@ -134,7 +143,6 @@ impl RdpServerDisplay for MacDisplay {
 
     fn set_size(&mut self, width: u16, height: u16) {
         self.apply_resize(width, height, "server-config");
-        self.fixed_resolution = true;
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -189,10 +197,9 @@ impl RdpServerDisplay for MacDisplay {
         let display_sleep = crate::power::DisplaySleepGuard::hold();
         if crate::power::screen_is_locked() {
             tracing::warn!(
-                "Screen is locked: macOS does not allow third-party apps to type into the lock \
-                 screen, so the client can only view it. Set System Settings > Lock Screen > \
-                 \"Require password\" to a delay (or Never) so display sleep does not lock the \
-                 Mac, or unlock it on the Mac itself."
+                "Screen is locked: the lock screen is captured, and CGEvent keystrokes can \
+                 unlock it unless a Secure Input client is active. The true login window \
+                 (after logout/reboot) is view-only for third-party apps."
             );
         }
 
@@ -402,8 +409,13 @@ fn max_pending_acks(rtt_ms: f64, fps: u32) -> u32 {
     if rtt_ms <= 0.0 {
         return 3;
     }
-    let frame_interval_ms = 1000.0 / fps.max(1) as f64;
+    let frame_interval_ms = frame_interval_ms(fps);
     ((rtt_ms / frame_interval_ms).ceil() as u32 + 1).clamp(3, 8)
+}
+
+/// Duration of one frame at `fps`, in milliseconds.
+fn frame_interval_ms(fps: u32) -> f64 {
+    1000.0 / fps.max(1) as f64
 }
 /// Upper bound on consecutive ACK-backlog skips, so a client that suspends frame
 /// acknowledgements (SUSPEND_FRAME_ACKNOWLEDGEMENT) cannot stall the stream.
@@ -1201,14 +1213,18 @@ impl MacDisplayUpdates {
                                 ps.lock().unwrap().record_frame(encode_ms, total_bytes as u32, is_keyframe);
                             }
                             self.apply_adaptive_decision().await;
-                            let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                            if encode_ms > frame_interval_ms * 0.95 {
+                            // Compare against the rate the capturer is actually running at:
+                            // adaptive fps reduction happens after the session starts, and
+                            // judging by the configured rate would keep flagging every frame
+                            // as overloaded and skip half of them forever.
+                            let interval_ms = frame_interval_ms(self.last_applied_fps);
+                            if encode_ms > interval_ms * 0.95 {
                                 self.skip_next_frame = true;
                                 self.overload_count += 1;
                                 if self.overload_count % 60 == 1 {
                                     tracing::warn!(
                                         encode_ms = format!("{:.1}", encode_ms),
-                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                                        frame_interval_ms = format!("{:.1}", interval_ms),
                                         overload_total = self.overload_count,
                                         "encode overload — skipping frames"
                                     );
@@ -1283,14 +1299,16 @@ impl MacDisplayUpdates {
                             ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
                         }
                         self.apply_adaptive_decision().await;
-                        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                        if encode_ms > frame_interval_ms * 0.95 {
+                        // Same as the AVC444 path: the capturer's live rate may be lower than
+                        // the configured one after adaptive fps reduction.
+                        let interval_ms = frame_interval_ms(self.last_applied_fps);
+                        if encode_ms > interval_ms * 0.95 {
                             self.skip_next_frame = true;
                             self.overload_count += 1;
                             if self.overload_count % 60 == 1 {
                                 tracing::warn!(
                                     encode_ms = format!("{:.1}", encode_ms),
-                                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                                    frame_interval_ms = format!("{:.1}", interval_ms),
                                     overload_total = self.overload_count,
                                     "encode overload — skipping frames"
                                 );
@@ -1439,7 +1457,15 @@ impl MacDisplayUpdates {
 
 #[cfg(test)]
 mod tests {
-    use super::{CACHE_FLUSH_RETRY, IDLE_IDR_INTERVAL, flush_backoff, max_pending_acks};
+    use super::{CACHE_FLUSH_RETRY, IDLE_IDR_INTERVAL, flush_backoff, frame_interval_ms, max_pending_acks};
+
+    #[test]
+    fn frame_interval_tracks_fps() {
+        assert!((frame_interval_ms(60) - 16.667).abs() < 0.01);
+        assert!((frame_interval_ms(30) - 33.333).abs() < 0.01);
+        assert!((frame_interval_ms(15) - 66.667).abs() < 0.01);
+        assert_eq!(frame_interval_ms(0), 1000.0); // no divide-by-zero
+    }
 
     #[test]
     fn flush_backoff_doubles_and_caps() {

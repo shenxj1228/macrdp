@@ -59,6 +59,10 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            // HIToolbox's TIS calls assert they run on the main queue; prime the input-method
+            // flag here (main thread) so the RDP input thread only reads a cached bool.
+            macrdp_core::ime::prime();
+
             // Initialize application state
             state::init_app_state(&handle)?;
 
@@ -125,6 +129,7 @@ pub fn run() {
             commands::get_metrics,
             commands::get_connections,
             commands::get_permissions,
+            commands::get_local_addresses,
             commands::get_config,
             commands::set_config,
             commands::get_logs,

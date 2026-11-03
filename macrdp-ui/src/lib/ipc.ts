@@ -8,6 +8,7 @@ import type {
   ConnectionHistory,
   TrafficStats,
   UiConfig,
+  LocalAddress,
 } from "./types";
 
 export const api = {
@@ -17,6 +18,7 @@ export const api = {
   getMetrics: () => invoke<Metrics>("get_metrics"),
   getConnections: () => invoke<Connection[]>("get_connections"),
   getPermissions: () => invoke<PermissionStatus>("get_permissions"),
+  getLocalAddresses: () => invoke<LocalAddress[]>("get_local_addresses"),
   getConfig: () => invoke<UiConfig>("get_config"),
   setConfig: (key: string, value: unknown) =>
     invoke<{ restart_required: boolean }>("set_config", { key, value }),

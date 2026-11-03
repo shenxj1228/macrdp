@@ -38,18 +38,20 @@ frame_rate = 60
 # within this ceiling based on network conditions.
 # bitrate_mbps = 50
 
-# HiDPI scale factor
-# Default: 1 (no scaling)
-# Multiplies capture resolution for sharper image on Retina displays.
-# e.g. scale=2 on a 1920x1080 logical display → captures at 3840x2160 (4K)
-# Mouse coordinates are automatically mapped back to logical points.
+# Session resolution
+# Default: "auto" (detects the display's physical pixels, Retina scale applied). "auto" also
+# follows the client's window size when it connects, like Windows RDP.
+# A "WxH" value fixes the session size: the client cannot override it. Use this on high-DPI
+# clients (e.g. mstsc at 150%) whose logical window is smaller than the physical screen,
+# otherwise the desktop is shown 1:1 in a larger full-screen window with black borders.
 # resolution = "3840x2160"
 
 # Keep the display awake while the server runs
 # Default: false
-# macOS does not let third-party apps type into the lock screen, and display sleep locks the
-# Mac on default settings. With false, a client wakes the display on connect (fine only if
-# "Require password after display sleep" is set to a delay). Set true to keep the display on.
+# Display sleep also locks the Mac under default settings. With false, a client wakes the
+# display on connect; the lock screen can be typed into remotely (unless a Secure Input app
+# is active), but the true login window (after logout/reboot) is view-only. Set true to keep
+# the display on for the whole session.
 # keep_display_awake = true
 
 # ─── Encoding ──────────────────────────────────────────────────────────────────

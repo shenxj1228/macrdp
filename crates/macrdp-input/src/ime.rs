@@ -10,9 +10,52 @@ use core_foundation::string::CFString;
 use core_foundation_sys::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::string::CFStringRef;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 type TISInputSourceRef = *mut c_void;
+type DispatchQueue = *mut c_void;
+
+// HIToolbox's TIS functions call `dispatch_assert_queue(dispatch_get_main_queue())` and trap
+// (EXC_BREAKPOINT) when invoked from another thread — the RDP loop runs on its own thread, so
+// everything below is marshalled onto the main queue.
+#[link(name = "System")]
+extern "C" {
+    /// The main queue. `dispatch_get_main_queue()` is an inline wrapper in the SDK; the
+    /// exported symbol is this global (DISPATCH_EXPORT in dispatch/queue.h).
+    static _dispatch_main_q: u8;
+    fn dispatch_async_f(
+        queue: DispatchQueue,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
+    fn pthread_main_np() -> i32;
+}
+
+type MainBlock = Box<dyn FnOnce() + Send + 'static>;
+
+/// Run `f` on the main thread: directly when already there, otherwise asynchronously on the
+/// main queue (never `dispatch_sync`, which could deadlock with the UI thread).
+fn on_main(f: impl FnOnce() + Send + 'static) {
+    if unsafe { pthread_main_np() } != 0 {
+        f();
+        return;
+    }
+    let block: Box<MainBlock> = Box::new(Box::new(f));
+    let context = Box::into_raw(block) as *mut c_void;
+    let main_queue = std::ptr::addr_of!(_dispatch_main_q) as DispatchQueue;
+    unsafe { dispatch_async_f(main_queue, context, run_on_main) };
+}
+
+extern "C" fn run_on_main(context: *mut c_void) {
+    let block = unsafe { Box::from_raw(context as *mut MainBlock) };
+    // Never let a panic cross the C frame.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block()));
+}
+
+/// Whether an input method is enabled, cached by [`prime`] / [`toggle_input_source`] so the
+/// keyboard path can consult it without touching HIToolbox from the RDP thread.
+static HAS_INPUT_METHOD: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -122,11 +165,24 @@ fn same_property(source: TISInputSourceRef, key: CFTypeRef, expected: CFTypeRef)
     !value.is_null() && unsafe { core_foundation_sys::base::CFEqual(value, expected) } != 0
 }
 
+/// Detect whether at least one non-ASCII (IME) input source is enabled, and cache the result.
+///
+/// Call once at startup (from the main thread, or any thread — the work is marshalled). The
+/// keyboard injector then reads the cached flag instead of calling HIToolbox from the RDP
+/// thread, which would trap on the TIS main-queue assertion.
+pub fn prime() {
+    on_main(|| {
+        let has = SourceList::enabled_keyboard_sources()
+            .is_some_and(|list| list.sources.iter().any(|s| !s.ascii));
+        HAS_INPUT_METHOD.store(has, Ordering::Relaxed);
+        tracing::debug!(has_input_method = has, "Cached input method availability");
+    });
+}
+
 /// True when at least one non-ASCII (IME) input source is enabled. Callers use this to leave
 /// Caps Lock alone on systems that have no input method to switch to.
 pub fn has_input_method() -> bool {
-    SourceList::enabled_keyboard_sources()
-        .is_some_and(|list| list.sources.iter().any(|s| !s.ascii))
+    HAS_INPUT_METHOD.load(Ordering::Relaxed)
 }
 
 /// Preferred source of the requested kind: the one we last used, else the first enabled one.
@@ -145,35 +201,42 @@ fn pick<'a>(
 }
 
 /// Switch between the current IME and the ASCII keyboard, the way Caps Lock and Ctrl+Space do
-/// in the system UI. Returns true when the input source was changed.
-pub fn toggle_input_source() -> bool {
-    let Some(list) = SourceList::enabled_keyboard_sources() else {
-        return false;
-    };
-    let Some(current) = list.current() else {
-        return false;
-    };
+/// in the system UI. Runs on the main thread (HIToolbox requirement); the caller — the RDP
+/// input thread — is never blocked.
+pub fn toggle_input_source() {
+    on_main(|| {
+        let Some(list) = SourceList::enabled_keyboard_sources() else {
+            return;
+        };
+        let has_input_method = list.sources.iter().any(|s| !s.ascii);
+        HAS_INPUT_METHOD.store(has_input_method, Ordering::Relaxed);
+        if !has_input_method {
+            return;
+        }
+        let Some(current) = list.current() else {
+            return;
+        };
 
-    let target = if current.ascii {
-        pick(&list, &LAST_NON_ASCII, false)
-    } else {
-        pick(&list, &LAST_ASCII, true)
-    };
-    let Some(target) = target else {
-        return false;
-    };
+        let target = if current.ascii {
+            pick(&list, &LAST_NON_ASCII, false)
+        } else {
+            pick(&list, &LAST_ASCII, true)
+        };
+        let Some(target) = target else {
+            return;
+        };
 
-    // Remember where we came from so the next toggle returns here.
-    let remember = if current.ascii { &LAST_ASCII } else { &LAST_NON_ASCII };
-    if let Ok(mut slot) = remember.lock() {
-        *slot = Some(current.id.clone());
-    }
+        // Remember where we came from so the next toggle returns here.
+        let remember = if current.ascii { &LAST_ASCII } else { &LAST_NON_ASCII };
+        if let Ok(mut slot) = remember.lock() {
+            *slot = Some(current.id.clone());
+        }
 
-    let status = unsafe { TISSelectInputSource(target.reference) };
-    if status != 0 {
-        tracing::warn!(status, source = %target.id, "TISSelectInputSource failed");
-        return false;
-    }
-    tracing::debug!(source = %target.id, "Input source switched");
-    true
+        let status = unsafe { TISSelectInputSource(target.reference) };
+        if status != 0 {
+            tracing::warn!(status, source = %target.id, "TISSelectInputSource failed");
+            return;
+        }
+        tracing::debug!(source = %target.id, "Input source switched");
+    });
 }

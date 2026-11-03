@@ -38,6 +38,12 @@ export interface PermissionStatus {
   microphone: boolean;
 }
 
+export interface LocalAddress {
+  interface: string;
+  address: string;
+  kind: "lan" | "vpn" | "other";
+}
+
 export interface ConnectionHistory {
   id: number;
   client_ip: string;

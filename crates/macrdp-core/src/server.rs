@@ -334,7 +334,13 @@ async fn start_server_inner(
 
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
-    gfx_state.lock().unwrap().max_qp = config.max_qp;
+    {
+        let mut gs = gfx_state.lock().unwrap();
+        gs.max_qp = config.max_qp;
+        // "auto" follows the client's window; an explicit WxH is authoritative so a high-DPI
+        // client cannot shrink it and leave black borders around a full-screen window.
+        gs.fixed_resolution = res_mode != "auto";
+    }
 
     let (listener, port) = find_available_port("0.0.0.0", config.port)?;
     let bind_addr = listener.local_addr()?;
@@ -528,15 +534,12 @@ fn run_server_thread(args: ServerThreadArgs) {
             };
 
         // Create display
-        let res_fixed = args.config.resolution.as_deref().unwrap_or("auto") != "auto";
-        let fixed_resolution = (args.config.width > 0 && args.config.height > 0) || res_fixed;
         let bitrate_override = args.config.bitrate_mbps.map(|mbps| mbps * 1_000_000);
         let show_cursor = args.config.show_cursor.unwrap_or(true);
         let cursor_pdu = show_cursor && args.config.cursor_mode.as_deref() != Some("embedded");
         let display = MacDisplay::new(
             args.width,
             args.height,
-            fixed_resolution,
             args.config.frame_rate,
             args.quality,
             args.encoder_pref,
@@ -630,7 +633,9 @@ fn run_server_thread(args: ServerThreadArgs) {
                     }
                     ConfigUpdate::Resolution(res) => {
                         tracing::info!(%res, "Hot-update: resolution (next connection)");
-                        gfx_for_config.lock().unwrap().resolution = Some(res);
+                        let mut gs = gfx_for_config.lock().unwrap();
+                        gs.fixed_resolution = res != "auto";
+                        gs.resolution = Some(res);
                     }
                     ConfigUpdate::Encoder(enc) => {
                         tracing::info!(%enc, "Hot-update: encoder (next connection)");

@@ -1,9 +1,10 @@
 //! Power and lock-state helpers for remote sessions.
 //!
-//! Unlike Windows RDP, macOS gives third-party apps no way to type into the lock screen or
-//! login window: synthetic CGEvents are ignored there and the loginwindow session is isolated
-//! from user apps. So a remote session can only start on an awakened, unlocked desktop. What
-//! this module does:
+//! macOS has two distinct pre-desktop states. On the *lock screen* (the user is still logged
+//! in) the desktop can be captured and CGEvent keystrokes can unlock it. At the *login window*
+//! (after logout or reboot, no user session) third-party apps are view-only: injected input is
+//! ignored (rdar://5636091) unless they run a pre-login agent with Apple's private support.
+//! What this module does:
 //!
 //! - keep the *system* awake while the server runs, so the machine stays reachable (the
 //!   display is still allowed to sleep, as a Windows RDP host's screen would);

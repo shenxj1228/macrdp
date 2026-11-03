@@ -155,6 +155,12 @@ pub fn get_permissions() -> Result<serde_json::Value, String> {
     serde_json::to_value(&perms).map_err(|e| e.to_string())
 }
 
+/// IPv4 addresses of the active interfaces (LAN and VPN), for the address card in the UI.
+#[tauri::command]
+pub fn get_local_addresses() -> Result<Vec<macrdp_core::net::LocalAddress>, String> {
+    Ok(macrdp_core::net::local_addresses())
+}
+
 #[tauri::command]
 pub async fn get_config(
     state: State<'_, Arc<AppState>>,

@@ -262,7 +262,7 @@ function Settings() {
 
         {activeCategory === "display" && (
           <CategorySection title="显示">
-            <SettingRow label="分辨率" description="新连接生效，Auto 跟随屏幕">
+            <SettingRow label="分辨率" description="Auto 跟随客户端窗口；指定分辨率则固定为该尺寸（可消除高 DPI 客户端的黑边）">
               <Select
                 value={config.resolution || "auto"}
                 onValueChange={(v) => updateConfig("resolution", v)}
@@ -271,7 +271,7 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="auto">Auto</SelectItem>
+                  <SelectItem value="auto">自动（跟随客户端）</SelectItem>
                   <SelectItem value="7680x4320">7680 × 4320</SelectItem>
                   <SelectItem value="5120x2880">5120 × 2880</SelectItem>
                   <SelectItem value="3840x2160">3840 × 2160</SelectItem>
@@ -300,7 +300,7 @@ function Settings() {
 
             <SettingRow
               label="保持屏幕常亮"
-              description="服务运行期间不让显示器休眠。息屏会锁屏，而 macOS 不允许远程在锁屏界面输入，开启后可避免连上后停在锁屏"
+              description="服务运行期间不让显示器休眠。息屏默认会锁屏；锁屏界面可远程输入密码解锁，但重启后未登录的系统登录窗口无法远程操作"
             >
               <Switch
                 checked={config.keep_display_awake}
