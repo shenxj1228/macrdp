@@ -47,6 +47,7 @@
 
 ### 输入
 
+- **可配置的修饰键映射**（`[keyboard] modifier_mapping`）：默认 `shortcut` 按 Windows 习惯把 Ctrl 映射为 Command ⌘、Alt 映射为 Option ⌥、Win 映射为 Control，Ctrl+C/V/X、Ctrl+Delete 可直接使用；`position` 保留按物理位置的 Ctrl→Control、Alt→⌘、Win→⌥。
 - 远程 Caps Lock 可切换 macOS 输入法（Text Input Sources），用于中文输入场景。
 - 修复按 Caps Lock 导致服务崩溃：HIToolbox 的 TIS 接口要求在主线程调用，现在统一派发到主队列执行，并缓存输入法可用状态。
 

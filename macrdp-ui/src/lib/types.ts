@@ -74,6 +74,7 @@ export interface UiConfig {
   resolution: string;
   show_cursor: boolean;
   keep_display_awake: boolean;
+  keyboard_modifier_mapping: "shortcut" | "position";
   log_level: string;
   theme: string;
   autostart: boolean;

@@ -20,6 +20,14 @@ pub async fn start_server(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    start_server_inner(app, state.inner()).await
+}
+
+/// Start the RDP service. Shared by the UI command and the automatic start on app launch.
+pub(crate) async fn start_server_inner(
+    app: tauri::AppHandle,
+    state: &Arc<AppState>,
+) -> Result<(), String> {
     tracing::info!("start_server called");
 
     // Check if already running
@@ -31,8 +39,14 @@ pub async fn start_server(
         }
     }
 
-    // Load configuration from UI config
-    let config = state.ui_config.lock().await.to_server_config();
+    // Load configuration from UI config, generating credentials if the user left them empty.
+    let config = {
+        let mut ui = state.ui_config.lock().await;
+        if ui.ensure_credentials() {
+            let _ = ui.save();
+        }
+        ui.to_server_config()
+    };
 
     // Create the event bridge
     let bridge = TauriEventBridge::new(app.clone());

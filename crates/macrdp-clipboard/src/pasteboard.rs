@@ -12,8 +12,13 @@
 
 use std::path::PathBuf;
 
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF};
-use objc2_foundation::{NSData, NSString};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{
+    NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+    NSPasteboardWriting,
+};
+use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 use tracing::{debug, warn};
 
 /// Safe wrapper around `NSPasteboard.generalPasteboard`.
@@ -178,11 +183,12 @@ impl PasteboardBridge {
 
     /// Write file URLs to the pasteboard.
     ///
+    /// Finder accepts a pasted file only when the pasteboard holds NSURL objects written with
+    /// `writeObjects:` (setting a raw `public.file-url` string is not enough). Writing all
+    /// paths also makes multi-file paste work.
+    ///
     /// Returns the new change count, or -1 on failure.
-    /// Currently writes only the first file URL (multi-file requires NSURL writeObjects).
     pub fn write_file_urls(&self, paths: &[PathBuf]) -> i64 {
-        use objc2_app_kit::NSPasteboardTypeFileURL;
-
         if paths.is_empty() {
             return -1;
         }
@@ -190,23 +196,22 @@ impl PasteboardBridge {
         let pb = NSPasteboard::generalPasteboard();
         let change_count = pb.clearContents();
 
-        let file_url_type: &NSString = unsafe { NSPasteboardTypeFileURL };
+        let urls: Vec<Retained<NSURL>> = paths
+            .iter()
+            .map(|path| {
+                let path_str = NSString::from_str(&path.to_string_lossy());
+                NSURL::fileURLWithPath(&path_str)
+            })
+            .collect();
+        let objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = urls
+            .iter()
+            .map(|url| ProtocolObject::from_retained(url.clone()))
+            .collect();
+        let array = NSArray::from_retained_slice(&objects);
 
-        let url = format!("file://{}", paths[0].display());
-        let ns_str = NSString::from_str(&url);
-        if !pb.setString_forType(&ns_str, file_url_type) {
-            warn!(
-                "pasteboard: failed to write file URL: {}",
-                paths[0].display()
-            );
+        if !pb.writeObjects(&array) {
+            warn!(count = paths.len(), "pasteboard: writeObjects: for file URLs returned false");
             return -1;
-        }
-
-        if paths.len() > 1 {
-            warn!(
-                count = paths.len(),
-                "Multiple files received but only first written to pasteboard (multi-file paste not yet supported)"
-            );
         }
 
         change_count as i64

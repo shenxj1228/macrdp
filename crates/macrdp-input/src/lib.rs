@@ -6,7 +6,7 @@ pub mod keymap;
 pub mod mouse;
 
 pub use keyboard::KeyboardInjector;
-pub use keymap::scancode_to_keycode;
+pub use keymap::{scancode_to_keycode, ModifierMapping};
 pub use mouse::{MouseButton, MouseInjector};
 
 // FFI for Accessibility APIs

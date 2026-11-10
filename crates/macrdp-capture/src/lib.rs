@@ -570,14 +570,18 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
 pub fn detect_display_scale() -> Result<u32> {
     use core_graphics::display::CGDisplay;
     let main = CGDisplay::main();
-    let physical_w = main.pixels_wide() as u32;
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
-    let display = content.displays().into_iter().next()
-        .context("No display found")?;
-    let logical_w = display.width();
-    let scale = if logical_w > 0 { physical_w / logical_w } else { 1 };
-    Ok(scale.max(1))
+    // CGDisplayPixelsWide returns the *point* width for HiDPI modes (2560 on a "Looks like
+    // 2560×1440" 5K display), so comparing it with SCDisplay.width always yields 1. The
+    // display mode reports the backing pixel size separately from the point size.
+    let mode = main.display_mode().context("main display has no current mode")?;
+    let logical_w = mode.width();
+    let physical_w = mode.pixel_width();
+    let scale = if logical_w > 0 && physical_w >= logical_w {
+        physical_w / logical_w
+    } else {
+        1
+    };
+    Ok((scale.max(1)) as u32)
 }
 
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)

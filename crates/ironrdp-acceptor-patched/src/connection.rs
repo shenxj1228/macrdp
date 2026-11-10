@@ -15,7 +15,7 @@ use pdu::rdp::headers::ShareControlPdu;
 use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
 use pdu::{gcc, mcs, nego, rdp};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::FinalizationSequence;
@@ -35,6 +35,9 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     reactivation: bool,
+    /// Adopt the desktop size from the client's GCC core data before advertising our
+    /// capabilities. Used when the configured resolution is "auto".
+    follow_client_size: bool,
 }
 
 #[derive(Debug)]
@@ -65,6 +68,7 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             reactivation: false,
+            follow_client_size: false,
         }
     }
 
@@ -106,7 +110,20 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             reactivation: true,
+            follow_client_size: consumed.follow_client_size,
         })
+    }
+
+    /// Let the size requested in the client's GCC core data decide the session desktop size.
+    /// Must be set before the acceptor reaches `CapabilitiesSendServer` (i.e. before
+    /// `accept_begin`), otherwise the client has already been told a different size.
+    pub fn set_follow_client_size(&mut self, follow: bool) {
+        self.follow_client_size = follow;
+    }
+
+    /// Desktop size the server will advertise to the client.
+    pub fn desktop_size(&self) -> DesktopSize {
+        self.desktop_size
     }
 
     pub fn attach_static_channel<T>(&mut self, channel: T)
@@ -389,6 +406,50 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+
+                // "auto" resolution: the client's requested desktop size is in Client Core Data
+                // and arrives before CapabilitiesSendServer. Adopt it here so Demand Active
+                // advertises the size the client actually wants instead of the server's
+                // startup size (which the client would otherwise keep, leaving black borders).
+                if self.follow_client_size {
+                    let core = &gcc_blocks.core;
+                    // Desktop width/height is the pixel size the client wants for the session
+                    // (mstsc sends its window's pixel size, e.g. 3840×2160 for a full-screen
+                    // 4K window at 150% scaling). The optional desktopPhysicalWidth/Height
+                    // fields are the monitor's *physical size in millimeters*, not pixels —
+                    // using them as a resolution produced a 631×360 session.
+                    let requested_w = u32::from(core.desktop_width);
+                    let requested_h = u32::from(core.desktop_height);
+                    // Never advertise more than the server's native/initial size: the capture
+                    // surface cannot grow beyond the physical display.
+                    let width = u16::try_from(requested_w.min(u32::from(self.desktop_size.width)))
+                        .unwrap_or(self.desktop_size.width);
+                    let height = u16::try_from(requested_h.min(u32::from(self.desktop_size.height)))
+                        .unwrap_or(self.desktop_size.height);
+                    if width > 0 && height > 0 {
+                        info!(
+                            requested_w,
+                            requested_h,
+                            desktop_physical_mm_w = ?core.optional_data.desktop_physical_width,
+                            desktop_physical_mm_h = ?core.optional_data.desktop_physical_height,
+                            desktop_scale_factor = ?core.optional_data.desktop_scale_factor,
+                            device_scale_factor = ?core.optional_data.device_scale_factor,
+                            native_w = self.desktop_size.width,
+                            native_h = self.desktop_size.height,
+                            adopted_w = width,
+                            adopted_h = height,
+                            "Adopting client-requested desktop size (auto resolution)"
+                        );
+                        let size = DesktopSize { width, height };
+                        self.desktop_size = size;
+                        for capability in &mut self.server_capabilities {
+                            if let CapabilitySet::Bitmap(bitmap) = capability {
+                                bitmap.desktop_width = width;
+                                bitmap.desktop_height = height;
+                            }
+                        }
+                    }
+                }
 
                 let joined: Vec<_> = gcc_blocks
                     .network

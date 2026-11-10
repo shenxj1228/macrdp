@@ -1,5 +1,5 @@
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
-use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use macrdp_input::{KeyboardInjector, ModifierMapping, MouseButton, MouseInjector};
 use std::sync::{Arc, Mutex};
 
 /// Maps RDP desktop coordinates to macOS logical coordinates.
@@ -72,8 +72,8 @@ pub struct MacInputHandler {
 }
 
 impl MacInputHandler {
-    pub fn new(coord_mapper: MouseCoordMapper) -> Self {
-        let keyboard = KeyboardInjector::new()
+    pub fn new(coord_mapper: MouseCoordMapper, modifier_mapping: ModifierMapping) -> Self {
+        let keyboard = KeyboardInjector::new(modifier_mapping)
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
         let mouse = MouseInjector::new()

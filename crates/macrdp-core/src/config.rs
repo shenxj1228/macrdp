@@ -1,5 +1,6 @@
 //! Server configuration
 
+use macrdp_input::keymap::ModifierMapping;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -39,6 +40,58 @@ impl Default for ClipboardConfig {
             max_file_size_mb: 100,
         }
     }
+}
+
+/// Keyboard input configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    /// How the Windows modifier keys map onto macOS modifiers:
+    /// - "shortcut": Ctrl → Command ⌘, Alt → Option ⌥, Win → Control
+    ///   (Windows habits — Ctrl+C copies, Ctrl+V pastes, Ctrl+Delete trashes a file)
+    /// - "position": Ctrl → Control, Alt → Command ⌘, Win → Option ⌥
+    pub modifier_mapping: ModifierMapping,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            modifier_mapping: ModifierMapping::default(),
+        }
+    }
+}
+
+/// Generate a random alphanumeric password from the system CSPRNG.
+///
+/// Used when the configuration leaves the RDP password empty, so a fresh install never runs
+/// without authentication. Ambiguous characters (I, l, O, 0, 1) are excluded for readability.
+pub fn generate_password(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut bytes = vec![0u8; len];
+
+    use std::io::Read;
+    let from_urandom = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok();
+    if !from_urandom {
+        // Fallback if /dev/urandom is unavailable: pid + time seeded xorshift.
+        let mut state = std::process::id() as u64
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+        for byte in &mut bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+    }
+
+    bytes
+        .iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect()
 }
 
 /// Server configuration (loaded from TOML, shared between CLI and UI)
@@ -93,6 +146,9 @@ pub struct ServerConfig {
     /// Clipboard synchronization configuration
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    /// Keyboard input configuration
+    #[serde(default)]
+    pub keyboard: KeyboardConfig,
 }
 
 impl Default for ServerConfig {
@@ -119,6 +175,7 @@ impl Default for ServerConfig {
             max_qp: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
+            keyboard: KeyboardConfig::default(),
         }
     }
 }
@@ -218,5 +275,17 @@ mod tests {
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
         assert_eq!(config.password.as_deref(), Some("secret"));
+        // Missing sections fall back to defaults.
+        assert_eq!(config.keyboard.modifier_mapping, ModifierMapping::Shortcut);
+    }
+
+    #[test]
+    fn test_parse_keyboard_mapping() {
+        let toml_str = r#"
+            [keyboard]
+            modifier_mapping = "position"
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.keyboard.modifier_mapping, ModifierMapping::Position);
     }
 }

@@ -30,6 +30,9 @@ pub struct MacDisplay {
     /// Maximum resolution (auto-detected or configured). Client cannot exceed this.
     max_width: u16,
     max_height: u16,
+    /// Display-native size used when the configured resolution is "auto".
+    auto_width: u16,
+    auto_height: u16,
     frame_rate: u32,
     quality: Quality,
     encoder_pref: macrdp_encode::EncoderPreference,
@@ -76,9 +79,18 @@ impl MacDisplay {
             .zip(macrdp_capture::detect_display_scale().ok())
             .map(|((cg_w, cg_h), scale)| (width.max((cg_w * scale).min(u16::MAX as u32) as u16), height.max((cg_h * scale).min(u16::MAX as u32) as u16)))
             .unwrap_or((width.max(3840), height.max(2160)));
+        // Native size for "auto", independent of an explicit configured WxH.
+        let (auto_w, auto_h) = macrdp_capture::detect_cg_display_size().ok()
+            .zip(macrdp_capture::detect_display_scale().ok())
+            .map(|((cg_w, cg_h), scale)| (
+                (cg_w * scale).min(u16::MAX as u32) as u16,
+                (cg_h * scale).min(u16::MAX as u32) as u16,
+            ))
+            .unwrap_or((width, height));
         Self {
             width, height,
             max_width: max_w, max_height: max_h,
+            auto_width: auto_w.min(max_w), auto_height: auto_h.min(max_h),
             frame_rate, quality, encoder_pref, mode_444, show_cursor, cursor_pdu, bitrate_override, base_bitrate, gfx_state,
             coord_mapper,
             shared_audio_tx,
@@ -120,14 +132,20 @@ impl RdpServerDisplay for MacDisplay {
         DesktopSize { width: self.width, height: self.height }
     }
 
-    /// The client's window defines the session size, as with Windows RDP: adopt whatever it
-    /// announces (clamped to the physical display). The configured `resolution` is only the
-    /// default used before/without a client request — forcing it here made the desktop larger
-    /// or smaller than the client canvas, which mstsc renders scaled down with black borders.
-    ///
-    /// When the configured resolution is an explicit WxH, the size is fixed instead: a
-    /// high-DPI client asks for its logical window size (e.g. 2560×1440 at 150%), which mstsc
-    /// then shows 1:1 inside a 3840×2160 full-screen window — black borders on all sides.
+    /// Apply the configured resolution mode for a new connection. "auto" resets to the
+    /// display-native size; the acceptor then replaces it with the client's requested size
+    /// (its physical pixel size, clamped to the native display). An explicit "WxH" fixes it.
+    fn apply_resolution(&mut self, resolution: &str) {
+        if resolution == "auto" {
+            self.apply_resize(self.auto_width, self.auto_height, "config-auto");
+        } else if let Some((w, h)) = resolution
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
+        {
+            self.apply_resize(w, h, "config");
+        }
+    }
+
     fn request_resize(&mut self, width: u16, height: u16) {
         let fixed = self.gfx_state.lock().unwrap().fixed_resolution;
         if fixed {

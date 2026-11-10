@@ -141,6 +141,13 @@ impl FileTransferManager {
                 .insert(data_stream, (index as u32, RequestKind::Data));
 
             let size = desc.file_size.unwrap_or(0) as u32;
+            tracing::info!(
+                index,
+                name = %desc.name,
+                stream_id = size_stream,
+                size,
+                "Requesting file size from client"
+            );
             requests.push(FileContentsRequest {
                 stream_id: data_stream,
                 index: index as u32,
@@ -157,7 +164,11 @@ impl FileTransferManager {
     pub fn handle_contents_response(&mut self, response: &FileContentsResponse<'_>) {
         let stream_id = response.stream_id();
         let Some(&(file_index, kind)) = self.stream_to_index.get(&stream_id) else {
-            tracing::warn!(stream_id, "Unknown stream_id in file contents response");
+            tracing::warn!(
+                stream_id,
+                known = ?self.stream_to_index.keys().collect::<Vec<_>>(),
+                "Unknown stream_id in file contents response"
+            );
             return;
         };
 

@@ -1,7 +1,102 @@
+//! RDP scancode (Set 1) → macOS virtual keycode mapping.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+/// How the Windows modifier keys map onto macOS modifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModifierMapping {
+    /// Windows shortcut semantics — the default for Windows RDP clients:
+    /// Ctrl → Command (⌘), Alt → Option (⌥), Win → Control.
+    ///
+    /// Ctrl+C copies, Ctrl+V pastes, Ctrl+A selects all, Ctrl+Delete moves a file to the
+    /// Trash — the shortcuts a Windows user already has in their fingers.
+    #[default]
+    Shortcut,
+    /// Physical-position semantics:
+    /// Ctrl → Control, Alt → Command (⌘), Win → Option (⌥).
+    Position,
+}
+
+/// The macOS modifier a key should act as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    Shift,
+    Control,
+    Option,
+    Command,
+}
+
+impl ModifierMapping {
+    /// The macOS modifier that the Windows Ctrl key acts as. Used by the IME shortcut
+    /// handling, which must recognize Ctrl+Space regardless of the mapping mode.
+    pub fn ctrl_modifier(self) -> Modifier {
+        match self {
+            Self::Shortcut => Modifier::Command,
+            Self::Position => Modifier::Control,
+        }
+    }
+
+    fn alt_modifier(self) -> Modifier {
+        match self {
+            Self::Shortcut => Modifier::Option,
+            Self::Position => Modifier::Command,
+        }
+    }
+
+    fn win_modifier(self) -> Modifier {
+        match self {
+            Self::Shortcut => Modifier::Control,
+            Self::Position => Modifier::Option,
+        }
+    }
+}
+
+/// macOS virtual keycodes for the modifier keys (left, right).
+fn modifier_keycode(modifier: Modifier, right: bool) -> u16 {
+    match (modifier, right) {
+        (Modifier::Shift, false) => 0x38,
+        (Modifier::Shift, true) => 0x3C,
+        (Modifier::Control, false) => 0x3B,
+        (Modifier::Control, true) => 0x3E,
+        (Modifier::Option, false) => 0x3A,
+        (Modifier::Option, true) => 0x3D,
+        (Modifier::Command, false) => 0x37,
+        (Modifier::Command, true) => 0x36,
+    }
+}
+
+/// Resolve a Windows modifier scancode to the macOS keycode and modifier it should produce.
+/// Returns `None` for non-modifier keys.
+///
+/// Both the keycode and the returned modifier come from this one function, so the injected
+/// key and its event flags can never disagree (they did when the two were mapped separately).
+pub fn modifier_target(
+    scancode: u8,
+    extended: bool,
+    mapping: ModifierMapping,
+) -> Option<(u16, Modifier)> {
+    let (modifier, right) = match (scancode, extended) {
+        (0x2A, false) => (Modifier::Shift, false), // Left Shift
+        (0x36, false) => (Modifier::Shift, true),  // Right Shift
+        (0x1D, ext) => (mapping.ctrl_modifier(), ext), // Left/Right Ctrl
+        (0x38, ext) => (mapping.alt_modifier(), ext), // Left/Right Alt
+        (0x5B, true) => (mapping.win_modifier(), false), // Left Win
+        (0x5C, true) => (mapping.win_modifier(), true), // Right Win
+        _ => return None,
+    };
+    Some((modifier_keycode(modifier, right), modifier))
+}
+
 /// Convert an RDP scancode (Set 1) to a macOS virtual keycode.
 /// `extended` indicates an extended key (e.g., right Ctrl, arrow keys).
 /// Returns None if the scancode has no known mapping.
-pub fn scancode_to_keycode(scancode: u8, extended: bool) -> Option<u16> {
+pub fn scancode_to_keycode(scancode: u8, extended: bool, mapping: ModifierMapping) -> Option<u16> {
+    if let Some((keycode, _)) = modifier_target(scancode, extended, mapping) {
+        return Some(keycode);
+    }
     if extended {
         EXTENDED_SCANCODE_MAP.get(&scancode).copied()
     } else {
@@ -9,10 +104,10 @@ pub fn scancode_to_keycode(scancode: u8, extended: bool) -> Option<u16> {
     }
 }
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
-
-/// Standard (non-extended) RDP scancode → macOS keycode
+/// Standard (non-extended) RDP scancode → macOS keycode.
+///
+/// Modifier keys are handled by [`modifier_target`] because their target depends on the
+/// configured [`ModifierMapping`].
 static SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
     HashMap::from([
         // Row 1: Escape + F-keys
@@ -74,7 +169,6 @@ static SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
         (0x28, 0x27), // ' "
         (0x1C, 0x24), // Enter
         // Row 5: ZXCV
-        (0x2A, 0x38), // Left Shift
         (0x2C, 0x06), // Z
         (0x2D, 0x07), // X
         (0x2E, 0x08), // C
@@ -85,13 +179,7 @@ static SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
         (0x33, 0x2B), // , <
         (0x34, 0x2F), // . >
         (0x35, 0x2C), // / ?
-        (0x36, 0x3C), // Right Shift
-        // Row 6: Bottom — modifier mapping for Windows → macOS
-        // Physical layout: [Ctrl] [Win] [Alt] [Space] [Alt] [Win] [Ctrl]
-        //         macOS:   [Ctrl] [Opt] [Cmd] [Space] [Cmd] [Opt] [Ctrl]
-        // So: Ctrl→Control, Alt→Command (same position, primary modifier), Win→Option
-        (0x1D, 0x3B), // Left Ctrl → Left Control
-        (0x38, 0x37), // Left Alt → Left Command (⌘) — most intuitive: Alt+C → Cmd+C = copy
+        // Row 6: Bottom
         (0x39, 0x31), // Space
         // Numpad — always treat as numeric input (ignore NumLock state).
         // Non-extended scancodes map to numpad digits/operators;
@@ -116,15 +204,11 @@ static SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
     ])
 });
 
-/// Extended RDP scancode → macOS keycode
+/// Extended RDP scancode → macOS keycode.
+///
+/// Extended modifier keys (right Ctrl/Alt, Win) are handled by [`modifier_target`].
 static EXTENDED_SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
     HashMap::from([
-        // Modifier keys — Windows → macOS position-based mapping:
-        // Ctrl→Control, Alt→Command, Win→Option
-        (0x1D, 0x3Eu16), // Right Ctrl → Right Control
-        (0x38, 0x36),    // Right Alt → Right Command (⌘) — consistent with Left Alt→Left Cmd
-        (0x5B, 0x3A),    // Left Win → Left Option (⌥) — by position (between Ctrl and Alt/Cmd)
-        (0x5C, 0x3D),    // Right Win → Right Option (⌥)
         // Arrow keys
         (0x48, 0x7E), // Up
         (0x50, 0x7D), // Down
@@ -149,39 +233,157 @@ mod tests {
 
     #[test]
     fn test_common_keys() {
-        assert_eq!(scancode_to_keycode(0x1E, false), Some(0x00)); // A
-        assert_eq!(scancode_to_keycode(0x1C, false), Some(0x24)); // Enter
-        assert_eq!(scancode_to_keycode(0x39, false), Some(0x31)); // Space
-        assert_eq!(scancode_to_keycode(0x01, false), Some(0x35)); // Escape
+        assert_eq!(
+            scancode_to_keycode(0x1E, false, ModifierMapping::Shortcut),
+            Some(0x00)
+        ); // A
+        assert_eq!(
+            scancode_to_keycode(0x1C, false, ModifierMapping::Shortcut),
+            Some(0x24)
+        ); // Enter
+        assert_eq!(
+            scancode_to_keycode(0x39, false, ModifierMapping::Shortcut),
+            Some(0x31)
+        ); // Space
+        assert_eq!(
+            scancode_to_keycode(0x01, false, ModifierMapping::Shortcut),
+            Some(0x35)
+        ); // Escape
     }
 
     #[test]
-    fn test_modifier_keys() {
-        assert_eq!(scancode_to_keycode(0x2A, false), Some(0x38)); // Left Shift
-        assert_eq!(scancode_to_keycode(0x1D, false), Some(0x3B)); // Left Ctrl
-        assert_eq!(scancode_to_keycode(0x38, false), Some(0x37)); // Left Alt → Cmd
+    fn test_shortcut_modifier_mapping() {
+        // Windows habits: Ctrl → Command, Alt → Option, Win → Control.
+        assert_eq!(
+            scancode_to_keycode(0x1D, false, ModifierMapping::Shortcut),
+            Some(0x37)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x1D, true, ModifierMapping::Shortcut),
+            Some(0x36)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x38, false, ModifierMapping::Shortcut),
+            Some(0x3A)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x38, true, ModifierMapping::Shortcut),
+            Some(0x3D)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x5B, true, ModifierMapping::Shortcut),
+            Some(0x3B)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x5C, true, ModifierMapping::Shortcut),
+            Some(0x3E)
+        );
+        // Shift is unchanged in both modes.
+        assert_eq!(
+            scancode_to_keycode(0x2A, false, ModifierMapping::Shortcut),
+            Some(0x38)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x36, false, ModifierMapping::Shortcut),
+            Some(0x3C)
+        );
+    }
+
+    #[test]
+    fn test_position_modifier_mapping() {
+        // Physical positions: Ctrl → Control, Alt → Command, Win → Option.
+        assert_eq!(
+            scancode_to_keycode(0x1D, false, ModifierMapping::Position),
+            Some(0x3B)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x1D, true, ModifierMapping::Position),
+            Some(0x3E)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x38, false, ModifierMapping::Position),
+            Some(0x37)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x38, true, ModifierMapping::Position),
+            Some(0x36)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x5B, true, ModifierMapping::Position),
+            Some(0x3A)
+        );
+        assert_eq!(
+            scancode_to_keycode(0x5C, true, ModifierMapping::Position),
+            Some(0x3D)
+        );
+    }
+
+    #[test]
+    fn test_modifier_target_flag_matches_keycode() {
+        // The modifier returned alongside the keycode must be the one that keycode emits.
+        assert_eq!(
+            modifier_target(0x1D, false, ModifierMapping::Shortcut),
+            Some((0x37, Modifier::Command))
+        );
+        assert_eq!(
+            modifier_target(0x38, false, ModifierMapping::Shortcut),
+            Some((0x3A, Modifier::Option))
+        );
+        assert_eq!(
+            modifier_target(0x5B, true, ModifierMapping::Shortcut),
+            Some((0x3B, Modifier::Control))
+        );
+        assert_eq!(
+            modifier_target(0x1D, false, ModifierMapping::Position),
+            Some((0x3B, Modifier::Control))
+        );
+        assert_eq!(
+            modifier_target(0x38, false, ModifierMapping::Position),
+            Some((0x37, Modifier::Command))
+        );
+        assert_eq!(
+            modifier_target(0x5B, true, ModifierMapping::Position),
+            Some((0x3A, Modifier::Option))
+        );
     }
 
     #[test]
     fn test_extended_keys() {
-        assert_eq!(scancode_to_keycode(0x1D, true), Some(0x3E)); // Right Ctrl → Right Control
-        assert_eq!(scancode_to_keycode(0x38, true), Some(0x36)); // Right Alt → Right Command
-        assert_eq!(scancode_to_keycode(0x5B, true), Some(0x3A)); // Left Win → Left Option
-        assert_eq!(scancode_to_keycode(0x5C, true), Some(0x3D)); // Right Win → Right Option
-        assert_eq!(scancode_to_keycode(0x48, true), Some(0x7E)); // Arrow Up
-        assert_eq!(scancode_to_keycode(0x50, true), Some(0x7D)); // Arrow Down
-        assert_eq!(scancode_to_keycode(0x4B, true), Some(0x7B)); // Arrow Left
-        assert_eq!(scancode_to_keycode(0x4D, true), Some(0x7C)); // Arrow Right
+        assert_eq!(
+            scancode_to_keycode(0x48, true, ModifierMapping::Shortcut),
+            Some(0x7E)
+        ); // Arrow Up
+        assert_eq!(
+            scancode_to_keycode(0x50, true, ModifierMapping::Shortcut),
+            Some(0x7D)
+        ); // Arrow Down
+        assert_eq!(
+            scancode_to_keycode(0x4B, true, ModifierMapping::Shortcut),
+            Some(0x7B)
+        ); // Arrow Left
+        assert_eq!(
+            scancode_to_keycode(0x4D, true, ModifierMapping::Shortcut),
+            Some(0x7C)
+        ); // Arrow Right
     }
 
     #[test]
     fn test_unknown_scancode() {
-        assert_eq!(scancode_to_keycode(0xFF, false), None);
+        assert_eq!(
+            scancode_to_keycode(0xFF, false, ModifierMapping::Shortcut),
+            None
+        );
     }
 
     #[test]
     fn test_number_keys() {
-        assert_eq!(scancode_to_keycode(0x02, false), Some(0x12)); // 1
-        assert_eq!(scancode_to_keycode(0x0B, false), Some(0x1D)); // 0
+        assert_eq!(
+            scancode_to_keycode(0x02, false, ModifierMapping::Shortcut),
+            Some(0x12)
+        ); // 1
+        assert_eq!(
+            scancode_to_keycode(0x0B, false, ModifierMapping::Shortcut),
+            Some(0x1D)
+        ); // 0
     }
 }

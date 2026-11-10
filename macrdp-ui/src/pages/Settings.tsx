@@ -21,6 +21,7 @@ const categories = [
   { id: "network", label: "网络" },
   { id: "security", label: "安全" },
   { id: "display", label: "显示" },
+  { id: "input", label: "输入" },
   { id: "audio", label: "音频" },
   { id: "general", label: "通用" },
 ] as const;
@@ -306,6 +307,28 @@ function Settings() {
                 checked={config.keep_display_awake}
                 onCheckedChange={(checked) => updateConfig("keep_display_awake", checked)}
               />
+            </SettingRow>
+          </CategorySection>
+        )}
+
+        {activeCategory === "input" && (
+          <CategorySection title="输入">
+            <SettingRow
+              label="修饰键映射"
+              description="Windows 快捷键：Ctrl→⌘、Alt→⌥、Win→Control，Ctrl+C 复制、Ctrl+V 粘贴、Ctrl+Delete 删除文件；物理位置：Ctrl→Control、Alt→⌘、Win→⌥"
+            >
+              <Select
+                value={config.keyboard_modifier_mapping}
+                onValueChange={(v) => updateConfig("keyboard_modifier_mapping", v)}
+              >
+                <SelectTrigger className="h-7 w-[220px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="shortcut">Windows 快捷键（Ctrl→⌘）</SelectItem>
+                  <SelectItem value="position">物理位置（Ctrl→Control）</SelectItem>
+                </SelectContent>
+              </Select>
             </SettingRow>
           </CategorySection>
         )}

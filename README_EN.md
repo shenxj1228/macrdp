@@ -47,6 +47,7 @@ This fork targets unattended, long-running remote use (mostly from Windows clien
 
 ### Input
 
+- **Configurable modifier mapping** (`[keyboard] modifier_mapping`): the default `shortcut` follows Windows habits — Ctrl→Command ⌘, Alt→Option ⌥, Win→Control — so Ctrl+C/V/X and Ctrl+Delete work directly; `position` keeps the physical layout (Ctrl→Control, Alt→⌘, Win→⌥).
 - Remote Caps Lock switches the macOS input method (Text Input Sources), for CJK input.
 - Fixed the crash when pressing Caps Lock remotely: HIToolbox's TIS APIs must be called on the main thread; all calls are now dispatched to the main queue and input-method availability is cached.
 

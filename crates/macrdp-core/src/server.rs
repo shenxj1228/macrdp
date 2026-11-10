@@ -500,7 +500,10 @@ fn run_server_thread(args: ServerThreadArgs) {
         };
 
         // Create input handler (clone coord_mapper — shared with display for resize sync)
-        let input_handler = MacInputHandler::new(args.coord_mapper.clone());
+        let input_handler = MacInputHandler::new(
+            args.coord_mapper.clone(),
+            args.config.keyboard.modifier_mapping,
+        );
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
         let shared_audio_tx = if args.config.audio.enabled {
@@ -566,36 +569,32 @@ fn run_server_thread(args: ServerThreadArgs) {
 
         server.set_gfx_state(Arc::clone(&args.gfx_state));
 
-        // Credentials
-        let (username, password) = match (&args.config.username, &args.config.password) {
-            (Some(u), Some(p)) => (u.clone(), p.clone()),
+        // Credentials — empty strings count as "not configured". Never start without auth:
+        // fall back to Admin plus a generated password.
+        let configured_user = args
+            .config
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|user| !user.is_empty());
+        let configured_pass = args
+            .config
+            .password
+            .as_deref()
+            .filter(|pass| !pass.is_empty());
+        let (username, password) = match (configured_user, configured_pass) {
+            (Some(user), Some(pass)) => (user.to_string(), pass.to_string()),
             _ => {
-                let seed = std::process::id() as u64
-                    ^ std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as u64;
-                let random_pass: String = (0..8)
-                    .map(|i| {
-                        let v = ((seed
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(i * 1442695040888963407))
-                            >> (i * 5 + 3))
-                            % 36;
-                        if v < 10 {
-                            (b'0' + v as u8) as char
-                        } else {
-                            (b'a' + (v - 10) as u8) as char
-                        }
-                    })
-                    .collect();
-                let user = "macrdp".to_string();
+                let user = configured_user.unwrap_or("Admin").to_string();
+                let random_pass = crate::config::generate_password(16);
                 tracing::warn!("No credentials in config — using generated credentials:");
                 println!("\n  ┌──────────────────────────────────┐");
                 println!("  │  Username: {:<22}│", &user);
                 println!("  │  Password: {:<22}│", &random_pass);
                 println!("  └──────────────────────────────────┘\n");
-                tracing::info!("Set [username] and [password] in ~/.config/macrdp/config.toml to use fixed credentials");
+                tracing::info!(
+                    "Set [username] and [password] in ~/.config/macrdp/config.toml to use fixed credentials"
+                );
                 (user, random_pass)
             }
         };

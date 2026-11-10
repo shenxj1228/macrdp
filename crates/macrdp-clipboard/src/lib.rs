@@ -21,6 +21,17 @@ use crate::formats::{uti_to_rdp_format_id, png_to_dib, dib_to_png, FORMAT_ID_HTM
 use crate::pasteboard::PasteboardBridge;
 use crate::transfer::FileTransferManager;
 
+/// Which kind of data we asked the client to send. The client picks the numeric format id
+/// (registered formats such as FileGroupDescriptorW have no fixed id), so remember the
+/// semantic kind instead of the id it happened to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPaste {
+    Text,
+    Image,
+    Html,
+    FileList,
+}
+
 /// macOS clipboard backend implementing the CLIPRDR protocol.
 ///
 /// Bridges between NSPasteboard and RDP CLIPRDR channel with:
@@ -36,7 +47,7 @@ pub struct MacClipboardBackend {
     poll_handle: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
     locked: bool,
-    pending_paste_format: Option<u32>,
+    pending_paste_format: Option<PendingPaste>,
 }
 
 impl fmt::Debug for MacClipboardBackend {
@@ -90,10 +101,13 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        // NOTE: CAN_LOCK_CLIPDATA is deliberately NOT advertised. With locking negotiated the
+        // protocol expects CLIPRDR_LOCK_CLIPDATA + a dataId in every FILECONTENTS_REQUEST;
+        // Windows then rejects our lock-less requests (error responses carrying streamId
+        // 0xFFFFFFFF) so streamed file paste never completes.
         ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
             | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
             | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
-            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
     }
 
     fn on_ready(&mut self) {
@@ -155,22 +169,52 @@ impl CliprdrBackend for MacClipboardBackend {
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         self.remote_formats = available_formats.to_vec();
 
-        // Request the highest-fidelity format available, in order of preference
-        let preferred = [FORMAT_ID_FILE_LIST, FORMAT_ID_HTML, 8, 13];
-        for &fmt_id in &preferred {
-            if available_formats.iter().any(|f| f.id().value() == fmt_id) {
-                self.pending_paste_format = Some(fmt_id);
-                let _ = self.event_sender.send(ServerEvent::Clipboard(
-                    ClipboardMessage::SendInitiatePaste(ClipboardFormatId::new(fmt_id)),
-                ));
-                return;
-            }
+        let described: Vec<String> = available_formats
+            .iter()
+            .map(|f| match f.name() {
+                Some(n) => format!("{}({})", f.id().value(), n.value()),
+                None => f.id().value().to_string(),
+            })
+            .collect();
+        tracing::info!(formats = ?described, "Remote clipboard format list");
+
+        // Registered formats (FileGroupDescriptorW / HTML Format) carry a name and an id the
+        // client chose; comparing only against our own id (0xD011) misses them on Windows.
+        let by_name = |name: &str| {
+            available_formats
+                .iter()
+                .find(|f| f.name().is_some_and(|n| n.value() == name))
+        };
+        let by_id = |id: u32| {
+            available_formats
+                .iter()
+                .find(|f| f.id().value() == id)
+        };
+
+        let target = by_name("FileGroupDescriptorW")
+            .map(|f| (PendingPaste::FileList, f))
+            .or_else(|| by_name("HTML Format").map(|f| (PendingPaste::Html, f)))
+            .or_else(|| by_id(13).map(|f| (PendingPaste::Text, f)))
+            .or_else(|| by_id(8).map(|f| (PendingPaste::Image, f)))
+            .or_else(|| by_id(FORMAT_ID_FILE_LIST).map(|f| (PendingPaste::FileList, f)))
+            .or_else(|| by_id(FORMAT_ID_HTML).map(|f| (PendingPaste::Html, f)));
+
+        if let Some((kind, format)) = target {
+            let format_id = format.id().value();
+            tracing::info!(?kind, format_id, "Requesting remote clipboard data");
+            self.pending_paste_format = Some(kind);
+            let _ = self.event_sender.send(ServerEvent::Clipboard(
+                ClipboardMessage::SendInitiatePaste(ClipboardFormatId::new(format_id)),
+            ));
+        } else {
+            tracing::warn!(formats = ?described, "No supported format in remote clipboard copy");
         }
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         let pb = PasteboardBridge::new();
         let format_id = request.format.value();
+        tracing::info!(format_id, "Client requested local clipboard data");
 
         let response = match format_id {
             13 => {
@@ -228,21 +272,31 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        let format = self.pending_paste_format.take();
+        tracing::info!(
+            ?format,
+            is_error = response.is_error(),
+            data_len = response.data().len(),
+            "Format data response from client"
+        );
         if response.is_error() {
             tracing::warn!("Received error format data response from client");
             return;
         }
 
-        let format = self.pending_paste_format.take();
         match format {
-            Some(13) => {
-                if let Ok(text) = response.to_unicode_string() {
-                    let pb = PasteboardBridge::new();
-                    let new_count = pb.write_string(&text);
-                    self.last_change_count.store(new_count, Ordering::SeqCst);
+            Some(PendingPaste::Text) => {
+                match response.to_unicode_string() {
+                    Ok(text) => {
+                        let pb = PasteboardBridge::new();
+                        let new_count = pb.write_string(&text);
+                        tracing::info!(chars = text.chars().count(), new_count, "Wrote remote text to pasteboard");
+                        self.last_change_count.store(new_count, Ordering::SeqCst);
+                    }
+                    Err(e) => tracing::warn!(?e, "Failed to decode remote text"),
                 }
             }
-            Some(8) => {
+            Some(PendingPaste::Image) => {
                 let data = response.data();
                 if data.len() >= formats::BITMAPINFOHEADER_SIZE {
                     if let Ok(png_data) = dib_to_png(data) {
@@ -252,15 +306,16 @@ impl CliprdrBackend for MacClipboardBackend {
                     }
                 }
             }
-            Some(id) if id == FORMAT_ID_HTML => {
+            Some(PendingPaste::Html) => {
                 if let Some(html_content) = crate::html::unwrap_html_format(response.data()) {
                     let pb = PasteboardBridge::new();
                     let new_count = pb.write_html(&html_content);
                     self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
             }
-            Some(id) if id == FORMAT_ID_FILE_LIST => {
+            Some(PendingPaste::FileList) => {
                 if let Ok(file_list) = response.to_file_list() {
+                    tracing::info!(files = file_list.files.len(), "Received file list from client");
                     self.transfer_manager.set_incoming_descriptors(file_list.files);
                     let requests = self.transfer_manager.generate_contents_requests();
                     for req in requests {
@@ -268,6 +323,8 @@ impl CliprdrBackend for MacClipboardBackend {
                             ServerEvent::ClipboardFileContentsRequest(req),
                         );
                     }
+                } else {
+                    tracing::warn!("Failed to decode file list from client");
                 }
             }
             _ => {
@@ -300,6 +357,11 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        tracing::info!(
+            stream_id = response.stream_id(),
+            data_len = response.data().len(),
+            "File contents response from client"
+        );
         self.transfer_manager.handle_contents_response(&response);
 
         if self.transfer_manager.all_incoming_complete() {

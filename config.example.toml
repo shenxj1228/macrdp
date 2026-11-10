@@ -12,7 +12,8 @@ port = 13389
 # ─── Authentication ────────────────────────────────────────────────────────────
 
 # RDP login credentials (NLA/Hybrid/CredSSP)
-# Both fields are optional — if omitted, any credentials are accepted
+# If either field is left empty, the server uses "Admin" and a random generated password
+# instead of accepting any credentials.
 username = "admin"
 password = "123456"
 
@@ -101,3 +102,14 @@ log_level = "info"
 # Idle timeout in seconds (disconnect after no input)
 # Default: 1800 (30 minutes)
 idle_timeout_secs = 1800
+
+# ─── Keyboard ──────────────────────────────────────────────────────────────────
+
+# Modifier key mapping for Windows RDP clients
+# Default: shortcut
+# Options:
+#   "shortcut" — Windows habits: Ctrl→Command ⌘, Alt→Option ⌥, Win→Control.
+#                Ctrl+C copies, Ctrl+V pastes, Ctrl+Delete moves a file to the Trash.
+#   "position" — physical positions: Ctrl→Control, Alt→Command ⌘, Win→Option ⌥.
+[keyboard]
+modifier_mapping = "shortcut"

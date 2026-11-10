@@ -354,6 +354,12 @@ pub trait RdpServerDisplay: Send {
     fn set_size(&mut self, _width: u16, _height: u16) {
         // Default: delegate to request_resize
     }
+
+    /// Apply the configured resolution mode ("auto" or "WxH") for a new connection.
+    /// "auto" resets to the display-native size; an explicit size is fixed.
+    fn apply_resolution(&mut self, _resolution: &str) {
+        // Default: ignore.
+    }
 }
 
 #[cfg(test)]

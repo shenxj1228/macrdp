@@ -30,6 +30,11 @@ pub struct UiConfig {
     /// Keep the display awake while the server runs (avoids the lock screen blocking input).
     pub keep_display_awake: bool,
 
+    // ── Input ───────────────────────────────────────────────
+    /// How Windows modifier keys map to macOS: "shortcut" (Ctrl→⌘, Windows habits) or
+    /// "position" (Ctrl→Control, Alt→⌘).
+    pub keyboard_modifier_mapping: String,
+
     // ── Application ─────────────────────────────────────────
     pub log_level: String,
     pub theme: String,
@@ -47,11 +52,12 @@ impl Default for UiConfig {
             bind_address: "0.0.0.0".to_string(),
             max_connections: 3,
             idle_timeout_secs: 1800,
-            username: "macrdp".to_string(),
+            username: "Admin".to_string(),
             password: String::new(),
             resolution: "auto".to_string(),
             show_cursor: false,
             keep_display_awake: false,
+            keyboard_modifier_mapping: "shortcut".to_string(),
             log_level: "warn".to_string(),
             theme: "system".to_string(),
             autostart: false,
@@ -73,14 +79,35 @@ impl UiConfig {
     pub fn load() -> Result<Self, String> {
         let path = config_path();
         if !path.exists() {
-            let cfg = Self::default();
+            let mut cfg = Self::default();
+            cfg.ensure_credentials();
             // Try to persist the defaults so the user has a file to edit.
             let _ = cfg.save();
             return Ok(cfg);
         }
         let content =
             std::fs::read_to_string(&path).map_err(|e| format!("read config: {e}"))?;
-        toml::from_str(&content).map_err(|e| format!("parse config: {e}"))
+        let mut config: Self = toml::from_str(&content).map_err(|e| format!("parse config: {e}"))?;
+        if config.ensure_credentials() {
+            let _ = config.save();
+        }
+        Ok(config)
+    }
+
+    /// Fill in default credentials when they are left empty: the RDP service must never run
+    /// without authentication. Returns whether anything changed (so the caller can persist it).
+    pub fn ensure_credentials(&mut self) -> bool {
+        let mut changed = false;
+        if self.username.trim().is_empty() {
+            self.username = "Admin".to_string();
+            changed = true;
+        }
+        if self.password.is_empty() {
+            self.password = macrdp_core::generate_password(16);
+            changed = true;
+            tracing::info!(username = %self.username, "No password configured — generated one");
+        }
+        changed
     }
 
     /// Serialize to TOML and write to `~/.macrdp/config-ui.toml`.
@@ -184,6 +211,18 @@ impl UiConfig {
                     .as_bool()
                     .ok_or("keep_display_awake must be a boolean")?;
             }
+            "keyboard_modifier_mapping" => {
+                let mapping = value
+                    .as_str()
+                    .ok_or("keyboard_modifier_mapping must be a string")?;
+                if mapping != "shortcut" && mapping != "position" {
+                    return Err(
+                        "keyboard_modifier_mapping must be \"shortcut\" or \"position\""
+                            .to_string(),
+                    );
+                }
+                self.keyboard_modifier_mapping = mapping.to_string();
+            }
             "log_level" => {
                 self.log_level = value
                     .as_str()
@@ -206,8 +245,9 @@ impl UiConfig {
 
         // Hot-updatable fields do NOT require a restart.
         // Only "theme" and "autostart" are pure UI settings.
-        // All other server settings are hot-updatable or auto-restarted.
-        let restart_required = false;
+        // All other server settings are hot-updatable or auto-restarted, except the
+        // keyboard mapping: the input handler reads it only when the server starts.
+        let restart_required = key == "keyboard_modifier_mapping";
         Ok(restart_required)
     }
 
@@ -239,6 +279,12 @@ impl UiConfig {
             max_qp: None,
             audio: macrdp_core::AudioConfig::default(),
             clipboard: macrdp_core::ClipboardConfig::default(),
+            keyboard: macrdp_core::KeyboardConfig {
+                modifier_mapping: match self.keyboard_modifier_mapping.as_str() {
+                    "position" => macrdp_core::ModifierMapping::Position,
+                    _ => macrdp_core::ModifierMapping::Shortcut,
+                },
+            },
         }
     }
 }

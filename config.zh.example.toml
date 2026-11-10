@@ -12,7 +12,7 @@ port = 13389
 # ─── 认证 ─────────────────────────────────────────────────────────────────────
 
 # RDP 登录凭据 (NLA/Hybrid/CredSSP 认证)
-# 两个字段均为可选 — 不设置则接受任意凭据
+# 用户名或密码留空时，服务端会使用 "Admin" + 随机生成的密码，而不是接受任意凭据
 username = "admin"
 password = "123456"
 
@@ -97,3 +97,14 @@ log_level = "info"
 # 空闲超时时间 (秒), 无输入操作后自动断开连接
 # 默认值: 1800 (30 分钟)
 idle_timeout_secs = 1800
+
+# ─── 键盘 ─────────────────────────────────────────────────────────────────────
+
+# Windows 客户端修饰键映射方式
+# 默认值: shortcut
+# 可选值:
+#   "shortcut" — Windows 按键习惯: Ctrl→Command ⌘, Alt→Option ⌥, Win→Control。
+#                Ctrl+C 复制、Ctrl+V 粘贴、Ctrl+Delete 删除文件。
+#   "position" — 按物理位置: Ctrl→Control, Alt→Command ⌘, Win→Option ⌥。
+[keyboard]
+modifier_mapping = "shortcut"

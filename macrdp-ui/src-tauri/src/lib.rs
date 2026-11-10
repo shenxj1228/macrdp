@@ -86,6 +86,23 @@ pub fn run() {
             // Setup tray icon
             tray::setup_tray(&handle)?;
 
+            // Start the RDP service together with the app. The UI command and this path share
+            // the same implementation, so the start button still works as a restart/stop.
+            {
+                let start_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = start_handle
+                        .state::<Arc<state::AppState>>()
+                        .inner()
+                        .clone();
+                    if let Err(e) =
+                        commands::start_server_inner(start_handle.clone(), &state).await
+                    {
+                        tracing::error!("Auto-start RDP server failed: {e}");
+                    }
+                });
+            }
+
             // Intercept main window close — hide instead of quit, and go back to being a
             // menu-bar-only app (no Dock icon while it runs in the background).
             if let Some(window) = app.get_webview_window("main") {

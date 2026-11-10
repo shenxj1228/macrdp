@@ -357,30 +357,36 @@ impl RdpServer {
 
         // Reset per-session GFX state for the new connection; size, avc444_enabled and all
         // hot-updated fields (bitrate/cursor/encoder/chroma/resolution) survive the reset.
-        let pending_resolution = {
+        let (pending_resolution, follow_client_size) = {
             let mut gs = self.gfx_state.lock().unwrap();
             gs.reset_session();
             gs.peer_addr = peer_ip;
-            gs.resolution.take()
+            // Keep the hot-updated value so it is re-applied on every reconnect, not just
+            // the first one after the setting changed.
+            (gs.resolution.clone(), !gs.fixed_resolution)
         };
 
-        // Apply hot-updated resolution for this new connection
+        // Apply the configured/hot-updated resolution for this new connection.
         if let Some(ref res) = pending_resolution {
             if let Some((w, h)) = res.split_once('x').and_then(|(w, h)| {
                 Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
             }) {
-                info!(w, h, "Applying hot-updated resolution for new connection");
+                info!(w, h, "Applying resolution for new connection");
                 // Use set_size (bypasses fixed_resolution check, since this is server-initiated)
                 self.display.lock().await.set_size(w, h);
                 let mut gs = self.gfx_state.lock().unwrap();
                 gs.width = w;
                 gs.height = h;
+            } else if res == "auto" {
+                self.display.lock().await.apply_resolution("auto");
             }
         }
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+        // In "auto" mode, adopt the size from the client's GCC core data before Demand Active.
+        acceptor.set_follow_client_size(follow_client_size);
 
         self.attach_channels(&mut acceptor);
 
@@ -918,6 +924,12 @@ impl RdpServer {
 
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
+        let reactivation = result.reactivation;
+        // Auto resolution: the acceptor already sized the session from the client's GCC data
+        // (preferring its physical pixel size). The client's Confirm Active bitmap echoes the
+        // *logical* size on high-DPI setups; adopting it here would shrink the desktop back and
+        // reintroduce the black borders, so keep the negotiated size on the initial accept.
+        let keep_negotiated_size = reactivation == false && !self.gfx_state.lock().unwrap().fixed_resolution;
         // Deactivate-Reactivate re-runs this without `reset_session`: a client that no longer
         // advertises LargePointer must drop back to 32x32.
         self.gfx_state.lock().unwrap().max_pointer_size = 32;
@@ -940,12 +952,17 @@ impl RdpServer {
                         info!(
                             client_w = client_size.width, client_h = client_size.height,
                             server_w = display_size.width, server_h = display_size.height,
+                            keep_negotiated_size,
                             "Client requested different resolution"
                         );
-                        // Adopt client resolution via request_resize
-                        self.display.lock().await.request_resize(
-                            client_size.width, client_size.height,
-                        );
+                        if keep_negotiated_size {
+                            debug!("Keeping negotiated auto resolution, ignoring client Confirm Active size");
+                        } else {
+                            // Adopt client resolution via request_resize
+                            self.display.lock().await.request_resize(
+                                client_size.width, client_size.height,
+                            );
+                        }
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {
@@ -1186,6 +1203,19 @@ impl RdpServer {
             let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
                 .await
                 .context("failed to accept client during finalize")?;
+
+            // In auto mode the acceptor adopted the client's GCC desktop size; resize the
+            // actual capture surface before the first frame so the encoder matches the client.
+            let accepted_size = acceptor.desktop_size();
+            info!(
+                w = accepted_size.width,
+                h = accepted_size.height,
+                "Applying negotiated session size"
+            );
+            self.display
+                .lock()
+                .await
+                .set_size(accepted_size.width, accepted_size.height);
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
